@@ -1,0 +1,418 @@
+diff --git a/cmd/flags/flag.go b/cmd/flags/flag.go
+index d8f79cc..d51e6d0 100644
+--- a/cmd/flags/flag.go
++++ b/cmd/flags/flag.go
+@@ -29,6 +29,11 @@ type Config struct {
+ 	ProtocolVersion      int     `json:"protocol_version" env:"AGENT_PROTOCOL_VERSION"`               // 上报协议版本，默认2
+ 	DisableCompression   bool    `json:"disable_compression" env:"AGENT_DISABLE_COMPRESSION"`         // 禁用v2传输压缩
+ 	PreferIPVersion      string  `json:"prefer_ip_version" env:"AGENT_PREFER_IP_VERSION"`             // 面板连接优先使用的 IP 版本：4 或 6
++	// Safe TCP probe policy. These options exist only in the TCP-safe build.
++	SafeTCPAllowHosts        string `json:"safe_tcp_allow_hosts" env:"AGENT_SAFE_TCP_ALLOW_HOSTS"`                   // Comma-separated exact hosts or *.suffix patterns
++	SafeTCPAllowPorts        string `json:"safe_tcp_allow_ports" env:"AGENT_SAFE_TCP_ALLOW_PORTS"`                   // Comma-separated TCP destination ports
++	SafeTCPTimeoutSeconds    int    `json:"safe_tcp_timeout_seconds" env:"AGENT_SAFE_TCP_TIMEOUT_SECONDS"`           // Per-probe timeout, clamped to 1-10 seconds
++	SafeTCPMaxTasksPerMinute int    `json:"safe_tcp_max_tasks_per_minute" env:"AGENT_SAFE_TCP_MAX_TASKS_PER_MINUTE"` // Sliding-window task limit
+ 
+ }
+ 
+diff --git a/cmd/root.go b/cmd/root.go
+index 428f643..ccb4eb2 100644
+--- a/cmd/root.go
++++ b/cmd/root.go
+@@ -56,6 +56,27 @@ var RootCmd = &cobra.Command{
+ 		if flags.PreferIPVersion != "" && flags.PreferIPVersion != "4" && flags.PreferIPVersion != "6" {
+ 			return fmt.Errorf("invalid --prefer-ip-version value %q: expected 4 or 6", flags.PreferIPVersion)
+ 		}
++		// This build intentionally exposes only a constrained TCP probe handler.
++		// Defaults are useful for the zstatic three-network targets while remaining
++		// deny-by-default for all other hosts and ports.
++		if strings.TrimSpace(flags.SafeTCPAllowHosts) == "" {
++			flags.SafeTCPAllowHosts = "*.ip.zstaticcdn.com"
++		}
++		if strings.TrimSpace(flags.SafeTCPAllowPorts) == "" {
++			flags.SafeTCPAllowPorts = "80,443"
++		}
++		if flags.SafeTCPTimeoutSeconds == 0 {
++			flags.SafeTCPTimeoutSeconds = 3
++		}
++		if flags.SafeTCPMaxTasksPerMinute == 0 {
++			flags.SafeTCPMaxTasksPerMinute = 30
++		}
++		if flags.SafeTCPTimeoutSeconds < 1 || flags.SafeTCPTimeoutSeconds > 10 {
++			return fmt.Errorf("invalid --safe-tcp-timeout: expected 1-10 seconds")
++		}
++		if flags.SafeTCPMaxTasksPerMinute < 1 || flags.SafeTCPMaxTasksPerMinute > 120 {
++			return fmt.Errorf("invalid --safe-tcp-max-tasks-per-minute: expected 1-120")
++		}
+ 		// 捕获中止信号，优雅退出
+ 		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+ 		defer stop()
+@@ -121,14 +142,11 @@ var RootCmd = &cobra.Command{
+ 		if flags.IgnoreUnsafeCert {
+ 			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+ 		}
+-		// 自动更新
+-		if !flags.DisableAutoUpdate {
+-			err := update.CheckAndUpdate()
+-			if err != nil {
+-				log.Println("[ERROR]", err)
+-			}
+-			go update.DoUpdateWorks()
+-		}
++		// Safe build: never invoke the upstream self-updater. It would replace this
++		// constrained binary with an upstream metric-only binary outside this repo's
++		// reviewed release process. Updates are delivered through this repository's releases.
++		flags.DisableAutoUpdate = true
++		log.Println("Automatic self-update is disabled in the TCP-safe build")
+ 		go server.DoUploadBasicInfoWorks()
+ 		for {
+ 			server.UpdateBasicInfo()
+@@ -194,6 +212,10 @@ func init() {
+ 	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
+ 	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
+ 	RootCmd.PersistentFlags().StringVar(&flags.PreferIPVersion, "prefer-ip-version", "", "Prefer IP version for dashboard connections: 4 or 6")
++	RootCmd.PersistentFlags().StringVar(&flags.SafeTCPAllowHosts, "safe-tcp-allow-hosts", "*.ip.zstaticcdn.com", "Allowed TCP probe hosts: exact names or *.suffix patterns")
++	RootCmd.PersistentFlags().StringVar(&flags.SafeTCPAllowPorts, "safe-tcp-allow-ports", "80,443", "Allowed TCP probe destination ports")
++	RootCmd.PersistentFlags().IntVar(&flags.SafeTCPTimeoutSeconds, "safe-tcp-timeout", 3, "TCP probe timeout in seconds (1-10)")
++	RootCmd.PersistentFlags().IntVar(&flags.SafeTCPMaxTasksPerMinute, "safe-tcp-max-tasks-per-minute", 30, "Maximum accepted TCP probe tasks per minute (1-120)")
+ 	RootCmd.PersistentFlags().ParseErrorsWhitelist.UnknownFlags = true
+ }
+ 
+diff --git a/server/safe_tcp_ping.go b/server/safe_tcp_ping.go
+new file mode 100644
+index 0000000..13860ee
+--- /dev/null
++++ b/server/safe_tcp_ping.go
+@@ -0,0 +1,255 @@
++package server
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"net/http"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/komari-monitor/komari-agent/dnsresolver"
++	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
++	"github.com/komari-monitor/komari-agent/ws"
++)
++
++// Safe TCP policy:
++//   * only the "tcp" ping type is implemented;
++//   * an explicit host:port is required;
++//   * host and port must be allow-listed;
++//   * DNS answers are pinned and private/local/reserved addresses are rejected;
++//   * a sliding-window limit prevents the agent being used for high-rate scanning.
++// There is deliberately no ICMP, HTTP, terminal, exec, file-transfer, or shell path.
++
++var safeTCPTaskWindow struct {
++	sync.Mutex
++	accepted []time.Time
++}
++
++func NewSafeTCPPingTask(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType, pingTarget string) {
++	if taskID == 0 {
++		log.Printf("ignored TCP probe without task id")
++		return
++	}
++
++	result := -1
++	if strings.EqualFold(strings.TrimSpace(pingType), "tcp") {
++		if !allowSafeTCPTask() {
++			log.Printf("TCP probe task %d rejected: rate limit", taskID)
++		} else if latency, err := measureSafeTCP(pingTarget); err != nil {
++			log.Printf("TCP probe task %d rejected/failed: %v", taskID, err)
++		} else {
++			result = int(latency.Milliseconds())
++		}
++	} else {
++		log.Printf("TCP probe task %d rejected: ping type %q is not allowed", taskID, pingType)
++	}
++
++	finishedAt := time.Now().UTC()
++	if protocolVersion >= 2 {
++		payload := v2.BuildPingResultPayload(taskID, "tcp", result, finishedAt)
++		if conn != nil {
++			if err := conn.WriteJSON(payload); err != nil {
++				log.Printf("failed to send TCP probe result over WebSocket: %v", err)
++			}
++			return
++		}
++		if err := postSafeTCPPingResult(payload); err != nil {
++			log.Printf("failed to POST TCP probe result: %v", err)
++		}
++		return
++	}
++
++	// v1 supports result delivery only while its report WebSocket is connected.
++	if conn == nil {
++		log.Printf("dropping v1 TCP probe result: no active WebSocket")
++		return
++	}
++	payload := map[string]interface{}{
++		"type":        "ping_result",
++		"task_id":     taskID,
++		"ping_type":   "tcp",
++		"value":       result,
++		"finished_at": finishedAt.Format(time.RFC3339Nano),
++	}
++	if err := conn.WriteJSON(payload); err != nil {
++		log.Printf("failed to send v1 TCP probe result: %v", err)
++	}
++}
++
++func allowSafeTCPTask() bool {
++	now := time.Now()
++	limit := flags.SafeTCPMaxTasksPerMinute
++	if limit < 1 {
++		limit = 30
++	}
++
++	safeTCPTaskWindow.Lock()
++	defer safeTCPTaskWindow.Unlock()
++	cutoff := now.Add(-time.Minute)
++	kept := safeTCPTaskWindow.accepted[:0]
++	for _, t := range safeTCPTaskWindow.accepted {
++		if t.After(cutoff) {
++			kept = append(kept, t)
++		}
++	}
++	safeTCPTaskWindow.accepted = kept
++	if len(safeTCPTaskWindow.accepted) >= limit {
++		return false
++	}
++	safeTCPTaskWindow.accepted = append(safeTCPTaskWindow.accepted, now)
++	return true
++}
++
++func measureSafeTCP(target string) (time.Duration, error) {
++	host, portText, err := net.SplitHostPort(strings.TrimSpace(target))
++	if err != nil {
++		return 0, errors.New("target must be an explicit host:port")
++	}
++	host = strings.TrimSuffix(strings.Trim(strings.TrimSpace(host), "[]"), ".")
++	if host == "" {
++		return 0, errors.New("empty target host")
++	}
++	port, err := strconv.Atoi(portText)
++	if err != nil || port < 1 || port > 65535 {
++		return 0, errors.New("invalid target port")
++	}
++	if !safeTCPHostAllowed(host) {
++		return 0, fmt.Errorf("host %q is not on the TCP probe allow-list", host)
++	}
++	if !safeTCPPortAllowed(port) {
++		return 0, fmt.Errorf("port %d is not on the TCP probe allow-list", port)
++	}
++
++	ips, err := net.LookupIP(host)
++	if err != nil || len(ips) == 0 {
++		return 0, errors.New("unable to resolve target host")
++	}
++	for _, ip := range ips {
++		if !safeTCPPublicIP(ip) {
++			return 0, fmt.Errorf("target resolves to a forbidden address: %s", ip)
++		}
++	}
++
++	timeout := time.Duration(flags.SafeTCPTimeoutSeconds) * time.Second
++	if timeout < time.Second {
++		timeout = 3 * time.Second
++	}
++	if timeout > 10*time.Second {
++		timeout = 10 * time.Second
++	}
++
++	// Pin the validated IP address. Do not dial the hostname after validation,
++	// otherwise a later DNS answer could turn the task into an internal probe.
++	address := net.JoinHostPort(ips[0].String(), strconv.Itoa(port))
++	start := time.Now()
++	conn, err := net.DialTimeout("tcp", address, timeout)
++	if err != nil {
++		return 0, err
++	}
++	_ = conn.Close()
++	return time.Since(start), nil
++}
++
++func safeTCPHostAllowed(host string) bool {
++	normalized := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
++	for _, raw := range strings.Split(flags.SafeTCPAllowHosts, ",") {
++		rule := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(raw), "."))
++		if rule == "" {
++			continue
++		}
++		if strings.HasPrefix(rule, "*.") {
++			suffix := strings.TrimPrefix(rule, "*") // keep leading dot
++			if strings.HasSuffix(normalized, suffix) && normalized != strings.TrimPrefix(suffix, ".") {
++				return true
++			}
++			continue
++		}
++		if normalized == rule {
++			return true
++		}
++	}
++	return false
++}
++
++func safeTCPPortAllowed(port int) bool {
++	for _, raw := range strings.Split(flags.SafeTCPAllowPorts, ",") {
++		value, err := strconv.Atoi(strings.TrimSpace(raw))
++		if err == nil && value == port {
++			return true
++		}
++	}
++	return false
++}
++
++func safeTCPPublicIP(ip net.IP) bool {
++	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() || ip.IsPrivate() ||
++		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
++		return false
++	}
++	if v4 := ip.To4(); v4 != nil {
++		switch {
++		case v4[0] == 0: // "this" network
++			return false
++		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // CGNAT
++			return false
++		case v4[0] == 192 && v4[1] == 0: // IETF protocol assignments
++			return false
++		case v4[0] == 192 && v4[1] == 0 && v4[2] == 2: // TEST-NET-1 (covered above)
++			return false
++		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // benchmarking
++			return false
++		case v4[0] == 198 && v4[1] == 51 && v4[2] == 100: // TEST-NET-2
++			return false
++		case v4[0] == 203 && v4[1] == 0 && v4[2] == 113: // TEST-NET-3
++			return false
++		case v4[0] >= 224: // multicast, reserved, and limited broadcast
++			return false
++		}
++	}
++	return true
++}
++
++func postSafeTCPPingResult(payload interface{}) error {
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return err
++	}
++	compressed := false
++	if !flags.DisableCompression {
++		if gz, err := gzipBytes(body); err == nil {
++			body = gz
++			compressed = true
++		}
++	}
++	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
++	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	if compressed {
++		req.Header.Set("Content-Encoding", "gzip")
++	}
++	if flags.CFAccessClientID != "" && flags.CFAccessClientSecret != "" {
++		req.Header.Set("CF-Access-Client-Id", flags.CFAccessClientID)
++		req.Header.Set("CF-Access-Client-Secret", flags.CFAccessClientSecret)
++	}
++	client := dnsresolver.GetHTTPClientWithPreference(30*time.Second, flags.PreferIPVersion)
++	resp, err := client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		data, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
++		return fmt.Errorf("status %s: %s", resp.Status, strings.TrimSpace(string(data)))
++	}
++	return nil
++}
+diff --git a/server/websocket.go b/server/websocket.go
+index 9700057..77d6db5 100644
+--- a/server/websocket.go
++++ b/server/websocket.go
+@@ -222,7 +222,7 @@ func runV2PullLoop(ctx context.Context, errCh chan<- error) {
+ 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
+ 		ackIDs := snapshotV2AckEventIDs()
+ 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
+-			"capabilities":  []string{"message", "event"}, // [defork] metric-only: removed exec/terminal/ping
++			"capabilities":  []string{"ping"}, // TCP-safe build: only the constrained ping handler is advertised
+ 			"ack_event_ids": ackIDs,
+ 		})
+ 		resp, err := postV2RequestContext(ctx, payload)
+@@ -380,14 +380,16 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
+ 			log.Println("WebSocket read error:", err)
+ 			return
+ 		}
+-		// [defork] metric-only agent: the only server->agent path still handled is
+-		// the v2 event channel (message/event, which are just logged). The v1
+-		// terminal/exec/ping dispatch has been removed. We keep reading so the
+-		// WebSocket processes control frames and disconnects are detected.
++		// This build accepts only TCP latency tasks. It does not contain terminal
++		// or shell-command handlers. Every target is checked by NewSafeTCPPingTask.
+ 		var message struct {
+-			JSONRPC string      `json:"jsonrpc,omitempty"`
+-			Method  string      `json:"method,omitempty"`
+-			Params  interface{} `json:"params,omitempty"`
++			JSONRPC    string      `json:"jsonrpc,omitempty"`
++			Method     string      `json:"method,omitempty"`
++			Params     interface{} `json:"params,omitempty"`
++			Message    string      `json:"message,omitempty"`
++			PingTaskID uint        `json:"ping_task_id,omitempty"`
++			PingType   string      `json:"ping_type,omitempty"`
++			PingTarget string      `json:"ping_target,omitempty"`
+ 		}
+ 		err = json.Unmarshal(message_raw, &message)
+ 		if err != nil {
+@@ -398,6 +400,9 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
+ 			processV2Event(conn, message.Method, message.Params, "")
+ 			continue
+ 		}
++		if protocolVersion < 2 && (message.Message == "ping" || message.PingTaskID != 0 || message.PingType != "" || message.PingTarget != "") {
++			go NewSafeTCPPingTask(conn, protocolVersion, message.PingTaskID, message.PingType, message.PingTarget)
++		}
+ 	}
+ }
+ 
+@@ -406,16 +411,25 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
+ 		return true
+ 	}
+ 	switch method {
+-	// [defork] metric-only agent: v2.MethodAgentExec, v2.MethodAgentTerminal and
+-	// v2.MethodAgentPing cases removed. Those events now fall through to the
+-	// default "unknown method" log and are not acted upon.
++	case v2.MethodAgentPing:
++		var task struct {
++			PingTaskID uint   `json:"ping_task_id"`
++			PingType   string `json:"ping_type"`
++			PingTarget string `json:"ping_target"`
++		}
++		if err := v2.BindParams(params, &task); err != nil {
++			log.Printf("invalid v2 ping task: %v", err)
++			return true // acknowledge malformed events to avoid a retry loop
++		}
++		go NewSafeTCPPingTask(conn, 2, task.PingTaskID, task.PingType, task.PingTarget)
++		return true
+ 	case v2.MethodAgentMessage, v2.MethodAgentEvent:
+ 		log.Printf("received v2 %s: %+v", method, params)
+ 		return true
+ 	default:
+-		log.Printf("unknown v2 event method %s", method)
++		log.Printf("ignored v2 event method %s in TCP-safe build", method)
++		return true // acknowledge unsupported control events; they are never executed
+ 	}
+-	return false
+ }
+ 
+ // connectWebSocket attempts to establish a WebSocket connection and upload basic info

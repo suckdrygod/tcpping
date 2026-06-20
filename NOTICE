@@ -1,0 +1,12 @@
+This repository produces a derivative build of the following project:
+
+  Komari Agent
+  Copyright (c) 2025 komari-monitor
+  https://github.com/komari-monitor/komari-agent
+
+The base project is MIT licensed. The full MIT license text is reproduced in LICENSE.
+
+The pinned source used by this build overlay is the hardened metric-only fork:
+
+  https://gitlab.com/mr-potato/komari-agent
+  commit fc8179e316bd07d710213416d86e884e5c0e2c19
