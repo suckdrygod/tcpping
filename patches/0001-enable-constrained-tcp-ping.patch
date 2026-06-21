@@ -416,3 +416,25 @@ index 9700057..77d6db5 100644
  }
  
  // connectWebSocket attempts to establish a WebSocket connection and upload basic info
+diff --git a/server/basicInfo.go b/server/basicInfo.go
+--- a/server/basicInfo.go
++++ b/server/basicInfo.go
+@@ -59,6 +59,8 @@ func uploadBasicInfo() error {
+ 		"gpu_name":           monitoring.GpuName(),
+ 		"virtualization":     monitoring.Virtualized(),
+ 		"version":            update.CurrentVersion,
++		"traffic_reset_day":      flags.MonthRotate,
++		"traffic_reset_timezone": time.Now().Location().String(),
+ 	}
+ 
+ 	// 尝试上传完整数据
+@@ -67,6 +69,9 @@ func uploadBasicInfo() error {
+ 		delete(data, "kernel_version")
+ 		// 兼容 <= 1.2.0
+ 		delete(data, "cpu_physical_cores")
++		// Older panels do not have the reset metadata columns yet.
++		delete(data, "traffic_reset_day")
++		delete(data, "traffic_reset_timezone")
+ 		err = tryUploadData(data)
+ 		if err != nil {
+ 			return err
