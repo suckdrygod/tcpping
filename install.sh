@@ -9,6 +9,7 @@ SERVICE='/etc/systemd/system/komari-agent.service'
 endpoint=''
 token=''
 month_rotate='0'
+timezone=''
 allow_hosts='*.ip.zstaticcdn.com'
 allow_ports='80,443'
 timeout='3'
@@ -31,6 +32,7 @@ TCP-safe policy options:
 
 Other:
       --month-rotate DAY             Network-statistics monthly reset day, 0-31 (default: 0)
+      --timezone IANA_NAME           Timezone used for reset boundaries (default: VPS timezone)
       --repo OWNER/REPO              Release repository override
   -h, --help                         Show this help
 USAGE
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     -e|--endpoint) endpoint="${2:?missing endpoint}"; shift 2 ;;
     -t|--token) token="${2:?missing token}"; shift 2 ;;
     --month-rotate) month_rotate="${2:?missing day}"; shift 2 ;;
+    --timezone) timezone="${2:?missing timezone}"; shift 2 ;;
     --safe-tcp-allow-hosts) allow_hosts="${2:?missing host list}"; shift 2 ;;
     --safe-tcp-allow-ports) allow_ports="${2:?missing port list}"; shift 2 ;;
     --safe-tcp-timeout) timeout="${2:?missing timeout}"; shift 2 ;;
@@ -56,6 +59,21 @@ done
 [[ "$timeout" =~ ^[0-9]+$ ]] && (( timeout >= 1 && timeout <= 10 )) || { echo 'Invalid --safe-tcp-timeout.' >&2; exit 2; }
 [[ "$rate" =~ ^[0-9]+$ ]] && (( rate >= 1 && rate <= 120 )) || { echo 'Invalid --safe-tcp-rate.' >&2; exit 2; }
 [[ "$month_rotate" =~ ^[0-9]+$ ]] && (( month_rotate >= 0 && month_rotate <= 31 )) || { echo 'Invalid --month-rotate.' >&2; exit 2; }
+
+if [[ -z "$timezone" ]]; then
+  if command -v timedatectl >/dev/null 2>&1; then
+    timezone="$(timedatectl show --property=Timezone --value 2>/dev/null || true)"
+  fi
+  if [[ -z "$timezone" && -r /etc/timezone ]]; then
+    timezone="$(tr -d '[:space:]' </etc/timezone)"
+  fi
+  if [[ -z "$timezone" && -L /etc/localtime ]]; then
+    timezone="$(readlink -f /etc/localtime | sed 's#^/usr/share/zoneinfo/##')"
+  fi
+  timezone="${timezone:-Etc/UTC}"
+fi
+[[ "$timezone" =~ ^[A-Za-z0-9_+./-]+$ ]] || { echo 'Invalid --timezone.' >&2; exit 2; }
+[[ -e "/usr/share/zoneinfo/$timezone" ]] || { echo "Timezone not found: $timezone" >&2; exit 2; }
 
 case "$(uname -m)" in
   x86_64|amd64) arch='amd64' ;;
@@ -89,6 +107,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=TZ=${timezone}
 ExecStart=${BINARY} -e ${endpoint@Q} -t ${token@Q} --disable-auto-update --month-rotate ${month_rotate} --safe-tcp-allow-hosts ${allow_hosts@Q} --safe-tcp-allow-ports ${allow_ports@Q} --safe-tcp-timeout ${timeout} --safe-tcp-max-tasks-per-minute ${rate}
 WorkingDirectory=${INSTALL_DIR}
 Restart=always

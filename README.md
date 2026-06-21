@@ -75,8 +75,23 @@ curl -fsSL https://raw.githubusercontent.com/suckdrygod/tcpping/main/install.sh 
   sudo bash -s -- \
   -e https://agent.example.com \
   -t YOUR_NODE_TOKEN \
-  --month-rotate 15
+  --month-rotate 15 \
+  --timezone Asia/Shanghai
 ```
+
+The agent reports the configured reset day and effective IANA timezone to a
+compatible Komari panel through its existing basic-info heartbeat. No extra
+daemon or detection tool is installed.
+
+### Upgrade an existing installation without entering its token again
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/suckdrygod/tcpping/main/upgrade.sh | sudo bash
+```
+
+The upgrade keeps the existing service arguments, including `--month-rotate`,
+and adds a small systemd timezone drop-in so the reported timezone exactly
+matches the reset boundary used by the agent.
 
 The installer creates/updates the `komari-agent.service` service, makes a timestamped backup of an existing `/opt/komari/agent`, and uses the safety defaults above.
 
