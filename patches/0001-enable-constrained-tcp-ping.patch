@@ -1,5 +1,5 @@
 diff --git a/cmd/flags/flag.go b/cmd/flags/flag.go
-index d8f79cc..d51e6d0 100644
+index d8f79cc..feb588b 100644
 --- a/cmd/flags/flag.go
 +++ b/cmd/flags/flag.go
 @@ -29,6 +29,12 @@ type Config struct {
@@ -16,7 +16,7 @@ index d8f79cc..d51e6d0 100644
  }
  
 diff --git a/cmd/root.go b/cmd/root.go
-index 428f643..ccb4eb2 100644
+index 428f643..2b81648 100644
 --- a/cmd/root.go
 +++ b/cmd/root.go
 @@ -56,6 +56,27 @@ var RootCmd = &cobra.Command{
@@ -47,7 +47,7 @@ index 428f643..ccb4eb2 100644
  		// 捕获中止信号，优雅退出
  		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
  		defer stop()
-@@ -121,14 +142,14 @@ var RootCmd = &cobra.Command{
+@@ -121,15 +142,15 @@ var RootCmd = &cobra.Command{
  		if flags.IgnoreUnsafeCert {
  			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
  		}
@@ -70,6 +70,7 @@ index 428f643..ccb4eb2 100644
 +		}
  		for {
  			server.UpdateBasicInfo()
+ 			server.EstablishWebSocketConnection()
 @@ -194,6 +215,11 @@ func init() {
  	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
  	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
@@ -82,6 +83,79 @@ index 428f643..ccb4eb2 100644
  	RootCmd.PersistentFlags().ParseErrorsWhitelist.UnknownFlags = true
  }
  
+diff --git a/protocol/v2/jsonrpc.go b/protocol/v2/jsonrpc.go
+index 7bde4d1..dddc0fe 100644
+--- a/protocol/v2/jsonrpc.go
++++ b/protocol/v2/jsonrpc.go
+@@ -17,6 +17,7 @@ const (
+ 	MethodAgentPing       = "agent.ping"
+ 	MethodAgentMessage    = "agent.message"
+ 	MethodAgentEvent      = "agent.event"
++	MethodAgentSSHLogin   = "agent.sshLogin"
+ 	MethodAgentTerminal   = "agent.terminal.request"
+ 	MethodAgentPull       = "agent.pull"
+ )
+diff --git a/server/basicInfo.go b/server/basicInfo.go
+index 234ae48..c6d05d0 100644
+--- a/server/basicInfo.go
++++ b/server/basicInfo.go
+@@ -45,20 +45,25 @@ func uploadBasicInfo() error {
+ 	ipv4, ipv6, _ := monitoring.GetIPAddress()
+ 
+ 	data := map[string]interface{}{
+-		"cpu_name":           cpu.CPUName,
+-		"cpu_cores":          cpu.CPUCores,
+-		"cpu_physical_cores": cpu.CPUPhysicalCores,
+-		"arch":               cpu.CPUArchitecture,
+-		"os":                 osname,
+-		"kernel_version":     kernelVersion,
+-		"ipv4":               ipv4,
+-		"ipv6":               ipv6,
+-		"mem_total":          monitoring.Ram().Total,
+-		"swap_total":         monitoring.Swap().Total,
+-		"disk_total":         monitoring.Disk().Total,
+-		"gpu_name":           monitoring.GpuName(),
+-		"virtualization":     monitoring.Virtualized(),
+-		"version":            update.CurrentVersion,
++		"cpu_name":               cpu.CPUName,
++		"cpu_cores":              cpu.CPUCores,
++		"cpu_physical_cores":     cpu.CPUPhysicalCores,
++		"arch":                   cpu.CPUArchitecture,
++		"os":                     osname,
++		"kernel_version":         kernelVersion,
++		"ipv4":                   ipv4,
++		"ipv6":                   ipv6,
++		"mem_total":              monitoring.Ram().Total,
++		"swap_total":             monitoring.Swap().Total,
++		"disk_total":             monitoring.Disk().Total,
++		"gpu_name":               monitoring.GpuName(),
++		"virtualization":         monitoring.Virtualized(),
++		"version":                update.CurrentVersion,
++		"traffic_reset_day":      flags.MonthRotate,
++		"traffic_reset_timezone": time.Now().Location().String(),
++	}
++	for k, v := range collectVnstatBasicInfo() {
++		data[k] = v
+ 	}
+ 
+ 	// 尝试上传完整数据
+@@ -68,6 +73,16 @@ func uploadBasicInfo() error {
+ 		delete(data, "kernel_version")
+ 		// 兼容 <= 1.2.0
+ 		delete(data, "cpu_physical_cores")
++		// Older panels do not have the reset metadata columns yet.
++		delete(data, "traffic_reset_day")
++		delete(data, "traffic_reset_timezone")
++		// Older panels do not have vnStat metadata columns yet.
++		delete(data, "vnstat_available")
++		delete(data, "vnstat_interface")
++		delete(data, "vnstat_total_up")
++		delete(data, "vnstat_total_down")
++		delete(data, "vnstat_updated_at")
++		delete(data, "vnstat_days")
+ 		err = tryUploadData(data)
+ 		if err != nil {
+ 			return err
 diff --git a/server/safe_tcp_ping.go b/server/safe_tcp_ping.go
 new file mode 100644
 index 0000000..13860ee
@@ -343,118 +417,9 @@ index 0000000..13860ee
 +	}
 +	return nil
 +}
-diff --git a/server/websocket.go b/server/websocket.go
-index 9700057..77d6db5 100644
---- a/server/websocket.go
-+++ b/server/websocket.go
-@@ -222,7 +222,7 @@ func runV2PullLoop(ctx context.Context, errCh chan<- error) {
- 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
- 		ackIDs := snapshotV2AckEventIDs()
- 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
--			"capabilities":  []string{"message", "event"}, // [defork] metric-only: removed exec/terminal/ping
-+			"capabilities":  []string{"ping"}, // TCP-safe build: only the constrained ping handler is advertised
- 			"ack_event_ids": ackIDs,
- 		})
- 		resp, err := postV2RequestContext(ctx, payload)
-@@ -380,14 +380,16 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
- 			log.Println("WebSocket read error:", err)
- 			return
- 		}
--		// [defork] metric-only agent: the only server->agent path still handled is
--		// the v2 event channel (message/event, which are just logged). The v1
--		// terminal/exec/ping dispatch has been removed. We keep reading so the
--		// WebSocket processes control frames and disconnects are detected.
-+		// This build accepts only TCP latency tasks. It does not contain terminal
-+		// or shell-command handlers. Every target is checked by NewSafeTCPPingTask.
- 		var message struct {
--			JSONRPC string      `json:"jsonrpc,omitempty"`
--			Method  string      `json:"method,omitempty"`
--			Params  interface{} `json:"params,omitempty"`
-+			JSONRPC    string      `json:"jsonrpc,omitempty"`
-+			Method     string      `json:"method,omitempty"`
-+			Params     interface{} `json:"params,omitempty"`
-+			Message    string      `json:"message,omitempty"`
-+			PingTaskID uint        `json:"ping_task_id,omitempty"`
-+			PingType   string      `json:"ping_type,omitempty"`
-+			PingTarget string      `json:"ping_target,omitempty"`
- 		}
- 		err = json.Unmarshal(message_raw, &message)
- 		if err != nil {
-@@ -398,6 +400,9 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
- 			processV2Event(conn, message.Method, message.Params, "")
- 			continue
- 		}
-+		if protocolVersion < 2 && (message.Message == "ping" || message.PingTaskID != 0 || message.PingType != "" || message.PingTarget != "") {
-+			go NewSafeTCPPingTask(conn, protocolVersion, message.PingTaskID, message.PingType, message.PingTarget)
-+		}
- 	}
- }
- 
-@@ -406,16 +411,25 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
- 		return true
- 	}
- 	switch method {
--	// [defork] metric-only agent: v2.MethodAgentExec, v2.MethodAgentTerminal and
--	// v2.MethodAgentPing cases removed. Those events now fall through to the
--	// default "unknown method" log and are not acted upon.
-+	case v2.MethodAgentPing:
-+		var task struct {
-+			PingTaskID uint   `json:"ping_task_id"`
-+			PingType   string `json:"ping_type"`
-+			PingTarget string `json:"ping_target"`
-+		}
-+		if err := v2.BindParams(params, &task); err != nil {
-+			log.Printf("invalid v2 ping task: %v", err)
-+			return true // acknowledge malformed events to avoid a retry loop
-+		}
-+		go NewSafeTCPPingTask(conn, 2, task.PingTaskID, task.PingType, task.PingTarget)
-+		return true
- 	case v2.MethodAgentMessage, v2.MethodAgentEvent:
- 		log.Printf("received v2 %s: %+v", method, params)
- 		return true
- 	default:
--		log.Printf("unknown v2 event method %s", method)
-+		log.Printf("ignored v2 event method %s in TCP-safe build", method)
-+		return true // acknowledge unsupported control events; they are never executed
- 	}
--	return false
- }
- 
- // connectWebSocket attempts to establish a WebSocket connection and upload basic info
-diff --git a/server/basicInfo.go b/server/basicInfo.go
---- a/server/basicInfo.go
-+++ b/server/basicInfo.go
-@@ -59,6 +59,8 @@ func uploadBasicInfo() error {
- 		"gpu_name":           monitoring.GpuName(),
- 		"virtualization":     monitoring.Virtualized(),
- 		"version":            update.CurrentVersion,
-+		"traffic_reset_day":      flags.MonthRotate,
-+		"traffic_reset_timezone": time.Now().Location().String(),
- 	}
- 
- 	// 尝试上传完整数据
-@@ -67,6 +69,9 @@ func uploadBasicInfo() error {
- 		delete(data, "kernel_version")
- 		// 兼容 <= 1.2.0
- 		delete(data, "cpu_physical_cores")
-+		// Older panels do not have the reset metadata columns yet.
-+		delete(data, "traffic_reset_day")
-+		delete(data, "traffic_reset_timezone")
- 		err = tryUploadData(data)
- 		if err != nil {
- 			return err
-diff --git a/protocol/v2/jsonrpc.go b/protocol/v2/jsonrpc.go
---- a/protocol/v2/jsonrpc.go
-+++ b/protocol/v2/jsonrpc.go
-@@ -18,5 +18,6 @@ const (
- 	MethodAgentMessage    = "agent.message"
- 	MethodAgentEvent      = "agent.event"
-+	MethodAgentSSHLogin   = "agent.sshLogin"
- 	MethodAgentTerminal   = "agent.terminal.request"
- 	MethodAgentPull       = "agent.pull"
- )
 diff --git a/server/ssh_login_watch.go b/server/ssh_login_watch.go
 new file mode 100644
+index 0000000..7762427
 --- /dev/null
 +++ b/server/ssh_login_watch.go
 @@ -0,0 +1,150 @@
@@ -610,6 +575,7 @@ new file mode 100644
 +}
 diff --git a/server/ssh_login_watch_test.go b/server/ssh_login_watch_test.go
 new file mode 100644
+index 0000000..8d5cf5e
 --- /dev/null
 +++ b/server/ssh_login_watch_test.go
 @@ -0,0 +1,25 @@
@@ -638,3 +604,232 @@ new file mode 100644
 +		}
 +	}
 +}
+diff --git a/server/vnstat.go b/server/vnstat.go
+new file mode 100644
+index 0000000..d6e8c6f
+--- /dev/null
++++ b/server/vnstat.go
+@@ -0,0 +1,106 @@
++package server
++
++import (
++	"context"
++	"encoding/json"
++	"log"
++	"os/exec"
++	"time"
++)
++
++type vnstatJSON struct {
++	Interfaces []vnstatInterface `json:"interfaces"`
++}
++
++type vnstatInterface struct {
++	Name    string        `json:"name"`
++	Traffic vnstatTraffic `json:"traffic"`
++}
++
++type vnstatTraffic struct {
++	Total vnstatCounter `json:"total"`
++	Day   []vnstatDay   `json:"day"`
++}
++
++type vnstatCounter struct {
++	Rx int64 `json:"rx"`
++	Tx int64 `json:"tx"`
++}
++
++type vnstatDay struct {
++	Date vnstatDate `json:"date"`
++	Rx   int64      `json:"rx"`
++	Tx   int64      `json:"tx"`
++}
++
++type vnstatDate struct {
++	Year  int `json:"year"`
++	Month int `json:"month"`
++	Day   int `json:"day"`
++}
++
++func collectVnstatBasicInfo() map[string]interface{} {
++	info, err := readVnstatJSON()
++	if err != nil {
++		log.Printf("vnStat unavailable: %v", err)
++		return map[string]interface{}{"vnstat_available": false}
++	}
++	iface, ok := selectVnstatInterface(info.Interfaces)
++	if !ok {
++		return map[string]interface{}{"vnstat_available": false}
++	}
++
++	days := make([]map[string]interface{}, 0, len(iface.Traffic.Day))
++	for _, day := range iface.Traffic.Day {
++		if day.Date.Year <= 0 || day.Date.Month <= 0 || day.Date.Day <= 0 {
++			continue
++		}
++		date := time.Date(day.Date.Year, time.Month(day.Date.Month), day.Date.Day, 0, 0, 0, 0, time.UTC)
++		days = append(days, map[string]interface{}{
++			"date": date.Format("2006-01-02"),
++			"up":   day.Tx,
++			"down": day.Rx,
++		})
++	}
++
++	return map[string]interface{}{
++		"vnstat_available":  true,
++		"vnstat_interface":  iface.Name,
++		"vnstat_total_up":   iface.Traffic.Total.Tx,
++		"vnstat_total_down": iface.Traffic.Total.Rx,
++		"vnstat_updated_at": time.Now().UTC().Format(time.RFC3339),
++		"vnstat_days":       days,
++	}
++}
++
++func readVnstatJSON() (vnstatJSON, error) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++
++	cmd := exec.CommandContext(ctx, "vnstat", "--json")
++	out, err := cmd.Output()
++	if err != nil {
++		return vnstatJSON{}, err
++	}
++
++	var parsed vnstatJSON
++	if err := json.Unmarshal(out, &parsed); err != nil {
++		return vnstatJSON{}, err
++	}
++	return parsed, nil
++}
++
++func selectVnstatInterface(interfaces []vnstatInterface) (vnstatInterface, bool) {
++	var selected vnstatInterface
++	found := false
++	var selectedTotal int64
++	for _, iface := range interfaces {
++		total := iface.Traffic.Total.Rx + iface.Traffic.Total.Tx
++		if !found || total > selectedTotal {
++			selected = iface
++			selectedTotal = total
++			found = true
++		}
++	}
++	return selected, found
++}
+diff --git a/server/vnstat_test.go b/server/vnstat_test.go
+new file mode 100644
+index 0000000..e5ac13e
+--- /dev/null
++++ b/server/vnstat_test.go
+@@ -0,0 +1,33 @@
++package server
++
++import "testing"
++
++func TestSelectVnstatInterfaceUsesLargestTotal(t *testing.T) {
++	iface, ok := selectVnstatInterface([]vnstatInterface{
++		{
++			Name: "eth0",
++			Traffic: vnstatTraffic{
++				Total: vnstatCounter{Rx: 100, Tx: 50},
++			},
++		},
++		{
++			Name: "ens3",
++			Traffic: vnstatTraffic{
++				Total: vnstatCounter{Rx: 200, Tx: 300},
++			},
++		},
++	})
++
++	if !ok {
++		t.Fatal("expected an interface to be selected")
++	}
++	if iface.Name != "ens3" {
++		t.Fatalf("expected ens3, got %s", iface.Name)
++	}
++}
++
++func TestSelectVnstatInterfaceHandlesEmptyList(t *testing.T) {
++	if _, ok := selectVnstatInterface(nil); ok {
++		t.Fatal("expected no interface to be selected")
++	}
++}
+diff --git a/server/websocket.go b/server/websocket.go
+index 9700057..77d6db5 100644
+--- a/server/websocket.go
++++ b/server/websocket.go
+@@ -222,7 +222,7 @@ func runV2PullLoop(ctx context.Context, errCh chan<- error) {
+ 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
+ 		ackIDs := snapshotV2AckEventIDs()
+ 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
+-			"capabilities":  []string{"message", "event"}, // [defork] metric-only: removed exec/terminal/ping
++			"capabilities":  []string{"ping"}, // TCP-safe build: only the constrained ping handler is advertised
+ 			"ack_event_ids": ackIDs,
+ 		})
+ 		resp, err := postV2RequestContext(ctx, payload)
+@@ -380,14 +380,16 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
+ 			log.Println("WebSocket read error:", err)
+ 			return
+ 		}
+-		// [defork] metric-only agent: the only server->agent path still handled is
+-		// the v2 event channel (message/event, which are just logged). The v1
+-		// terminal/exec/ping dispatch has been removed. We keep reading so the
+-		// WebSocket processes control frames and disconnects are detected.
++		// This build accepts only TCP latency tasks. It does not contain terminal
++		// or shell-command handlers. Every target is checked by NewSafeTCPPingTask.
+ 		var message struct {
+-			JSONRPC string      `json:"jsonrpc,omitempty"`
+-			Method  string      `json:"method,omitempty"`
+-			Params  interface{} `json:"params,omitempty"`
++			JSONRPC    string      `json:"jsonrpc,omitempty"`
++			Method     string      `json:"method,omitempty"`
++			Params     interface{} `json:"params,omitempty"`
++			Message    string      `json:"message,omitempty"`
++			PingTaskID uint        `json:"ping_task_id,omitempty"`
++			PingType   string      `json:"ping_type,omitempty"`
++			PingTarget string      `json:"ping_target,omitempty"`
+ 		}
+ 		err = json.Unmarshal(message_raw, &message)
+ 		if err != nil {
+@@ -398,6 +400,9 @@ func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<-
+ 			processV2Event(conn, message.Method, message.Params, "")
+ 			continue
+ 		}
++		if protocolVersion < 2 && (message.Message == "ping" || message.PingTaskID != 0 || message.PingType != "" || message.PingTarget != "") {
++			go NewSafeTCPPingTask(conn, protocolVersion, message.PingTaskID, message.PingType, message.PingTarget)
++		}
+ 	}
+ }
+ 
+@@ -406,16 +411,25 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
+ 		return true
+ 	}
+ 	switch method {
+-	// [defork] metric-only agent: v2.MethodAgentExec, v2.MethodAgentTerminal and
+-	// v2.MethodAgentPing cases removed. Those events now fall through to the
+-	// default "unknown method" log and are not acted upon.
++	case v2.MethodAgentPing:
++		var task struct {
++			PingTaskID uint   `json:"ping_task_id"`
++			PingType   string `json:"ping_type"`
++			PingTarget string `json:"ping_target"`
++		}
++		if err := v2.BindParams(params, &task); err != nil {
++			log.Printf("invalid v2 ping task: %v", err)
++			return true // acknowledge malformed events to avoid a retry loop
++		}
++		go NewSafeTCPPingTask(conn, 2, task.PingTaskID, task.PingType, task.PingTarget)
++		return true
+ 	case v2.MethodAgentMessage, v2.MethodAgentEvent:
+ 		log.Printf("received v2 %s: %+v", method, params)
+ 		return true
+ 	default:
+-		log.Printf("unknown v2 event method %s", method)
++		log.Printf("ignored v2 event method %s in TCP-safe build", method)
++		return true // acknowledge unsupported control events; they are never executed
+ 	}
+-	return false
+ }
+ 
+ // connectWebSocket attempts to establish a WebSocket connection and upload basic info
