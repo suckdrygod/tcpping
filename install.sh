@@ -82,14 +82,22 @@ case "$(uname -m)" in
 esac
 
 command -v curl >/dev/null 2>&1 || { echo 'curl is required.' >&2; exit 1; }
+command -v sha256sum >/dev/null 2>&1 || { echo 'sha256sum is required.' >&2; exit 1; }
 mkdir -p "$INSTALL_DIR"
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
-url="https://github.com/${REPO}/releases/latest/download/komari-agent-linux-${arch}"
+sumtmp="$(mktemp)"
+trap 'rm -f "$tmp" "$sumtmp"' EXIT
+asset="komari-agent-linux-${arch}"
+url="https://github.com/${REPO}/releases/latest/download/${asset}"
+checksums_url="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
 echo "Downloading TCP-safe agent for ${arch}..."
 curl -fL --proto '=https' --tlsv1.2 \
   --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
   "$url" -o "$tmp"
+curl -fsSL --proto '=https' --tlsv1.2 \
+  --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+  "$checksums_url" -o "$sumtmp"
+(cd "$(dirname "$tmp")" && grep -E "  ${asset}$" "$sumtmp" | sed "s#  ${asset}\$#  $(basename "$tmp")#" | sha256sum -c -)
 chmod 0755 "$tmp"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -110,6 +118,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=TZ=${timezone}
+Environment=AGENT_SSH_LOGIN_NOTIFY=true
 ExecStart=${BINARY} -e ${endpoint@Q} -t ${token@Q} --disable-auto-update --month-rotate ${month_rotate} --safe-tcp-allow-hosts ${allow_hosts@Q} --safe-tcp-allow-ports ${allow_ports@Q} --safe-tcp-timeout ${timeout} --safe-tcp-max-tasks-per-minute ${rate}
 WorkingDirectory=${INSTALL_DIR}
 Restart=always
