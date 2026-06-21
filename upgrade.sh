@@ -37,7 +37,9 @@ tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 url="https://github.com/${REPO}/releases/latest/download/komari-agent-linux-${arch}"
 echo "Downloading latest TCP-safe agent for ${arch}..."
-curl -fL --proto '=https' --tlsv1.2 "$url" -o "$tmp"
+curl -fL --proto '=https' --tlsv1.2 \
+  --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+  "$url" -o "$tmp"
 chmod 0755 "$tmp"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
