@@ -2,7 +2,7 @@ diff --git a/cmd/flags/flag.go b/cmd/flags/flag.go
 index d8f79cc..d51e6d0 100644
 --- a/cmd/flags/flag.go
 +++ b/cmd/flags/flag.go
-@@ -29,6 +29,11 @@ type Config struct {
+@@ -29,6 +29,12 @@ type Config struct {
  	ProtocolVersion      int     `json:"protocol_version" env:"AGENT_PROTOCOL_VERSION"`               // 上报协议版本，默认2
  	DisableCompression   bool    `json:"disable_compression" env:"AGENT_DISABLE_COMPRESSION"`         // 禁用v2传输压缩
  	PreferIPVersion      string  `json:"prefer_ip_version" env:"AGENT_PREFER_IP_VERSION"`             // 面板连接优先使用的 IP 版本：4 或 6
@@ -11,6 +11,7 @@ index d8f79cc..d51e6d0 100644
 +	SafeTCPAllowPorts        string `json:"safe_tcp_allow_ports" env:"AGENT_SAFE_TCP_ALLOW_PORTS"`                   // Comma-separated TCP destination ports
 +	SafeTCPTimeoutSeconds    int    `json:"safe_tcp_timeout_seconds" env:"AGENT_SAFE_TCP_TIMEOUT_SECONDS"`           // Per-probe timeout, clamped to 1-10 seconds
 +	SafeTCPMaxTasksPerMinute int    `json:"safe_tcp_max_tasks_per_minute" env:"AGENT_SAFE_TCP_MAX_TASKS_PER_MINUTE"` // Sliding-window task limit
++	SSHLoginNotify           bool   `json:"ssh_login_notify" env:"AGENT_SSH_LOGIN_NOTIFY"`                         // Read-only successful SSH login notifications
  
  }
  
@@ -46,7 +47,7 @@ index 428f643..ccb4eb2 100644
  		// 捕获中止信号，优雅退出
  		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
  		defer stop()
-@@ -121,14 +142,11 @@ var RootCmd = &cobra.Command{
+@@ -121,14 +142,14 @@ var RootCmd = &cobra.Command{
  		if flags.IgnoreUnsafeCert {
  			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
  		}
@@ -64,9 +65,12 @@ index 428f643..ccb4eb2 100644
 +		flags.DisableAutoUpdate = true
 +		log.Println("Automatic self-update is disabled in the TCP-safe build")
  		go server.DoUploadBasicInfoWorks()
++		if flags.SSHLoginNotify {
++			go server.StartSSHLoginWatcher(stopCtx)
++		}
  		for {
  			server.UpdateBasicInfo()
-@@ -194,6 +212,10 @@ func init() {
+@@ -194,6 +215,11 @@ func init() {
  	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
  	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
  	RootCmd.PersistentFlags().StringVar(&flags.PreferIPVersion, "prefer-ip-version", "", "Prefer IP version for dashboard connections: 4 or 6")
@@ -74,6 +78,7 @@ index 428f643..ccb4eb2 100644
 +	RootCmd.PersistentFlags().StringVar(&flags.SafeTCPAllowPorts, "safe-tcp-allow-ports", "80,443", "Allowed TCP probe destination ports")
 +	RootCmd.PersistentFlags().IntVar(&flags.SafeTCPTimeoutSeconds, "safe-tcp-timeout", 3, "TCP probe timeout in seconds (1-10)")
 +	RootCmd.PersistentFlags().IntVar(&flags.SafeTCPMaxTasksPerMinute, "safe-tcp-max-tasks-per-minute", 30, "Maximum accepted TCP probe tasks per minute (1-120)")
++	RootCmd.PersistentFlags().BoolVar(&flags.SSHLoginNotify, "ssh-login-notify", false, "Send successful SSH login metadata to the panel")
  	RootCmd.PersistentFlags().ParseErrorsWhitelist.UnknownFlags = true
  }
  
@@ -438,3 +443,198 @@ diff --git a/server/basicInfo.go b/server/basicInfo.go
  		err = tryUploadData(data)
  		if err != nil {
  			return err
+diff --git a/protocol/v2/jsonrpc.go b/protocol/v2/jsonrpc.go
+--- a/protocol/v2/jsonrpc.go
++++ b/protocol/v2/jsonrpc.go
+@@ -18,5 +18,6 @@ const (
+ 	MethodAgentMessage    = "agent.message"
+ 	MethodAgentEvent      = "agent.event"
++	MethodAgentSSHLogin   = "agent.sshLogin"
+ 	MethodAgentTerminal   = "agent.terminal.request"
+ 	MethodAgentPull       = "agent.pull"
+ )
+diff --git a/server/ssh_login_watch.go b/server/ssh_login_watch.go
+new file mode 100644
+--- /dev/null
++++ b/server/ssh_login_watch.go
+@@ -0,0 +1,150 @@
++package server
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"os"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++
++	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
++)
++
++var acceptedSSHLoginPattern = regexp.MustCompile(`sshd(?:\[[0-9]+\])?: Accepted ([^ ]+) for ([A-Za-z0-9._-]+) from ([0-9A-Fa-f:.]+) port ([0-9]+)`)
++
++type sshLogState struct {
++	path   string
++	offset int64
++	info   os.FileInfo
++}
++
++// StartSSHLoginWatcher tails only successful OpenSSH authentication records.
++// It never writes SSH configuration and never executes a command. Existing
++// log contents are skipped on startup so an agent restart cannot replay old
++// login events.
++func StartSSHLoginWatcher(ctx context.Context) {
++	paths := []string{"/var/log/auth.log", "/var/log/secure"}
++	states := make(map[string]*sshLogState, len(paths))
++	for _, path := range paths {
++		if state := openSSHLogAtEnd(path); state != nil {
++			states[path] = state
++			log.Printf("SSH login notifier watching %s", path)
++		}
++	}
++	if len(states) == 0 {
++		log.Printf("SSH login notifier waiting for /var/log/auth.log or /var/log/secure")
++	}
++
++	ticker := time.NewTicker(2 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++			for _, path := range paths {
++				state := states[path]
++				if state == nil {
++					if next := openSSHLogAtEnd(path); next != nil {
++						states[path] = next
++						log.Printf("SSH login notifier watching %s", path)
++					}
++					continue
++				}
++				if err := pollSSHLog(state); err != nil && !os.IsNotExist(err) {
++					log.Printf("SSH login notifier failed to read %s: %v", path, err)
++				}
++			}
++		}
++	}
++}
++
++func openSSHLogAtEnd(path string) *sshLogState {
++	info, err := os.Stat(path)
++	if err != nil || !info.Mode().IsRegular() {
++		return nil
++	}
++	return &sshLogState{path: path, offset: info.Size(), info: info}
++}
++
++func pollSSHLog(state *sshLogState) error {
++	info, err := os.Stat(state.path)
++	if err != nil {
++		return err
++	}
++	if !os.SameFile(state.info, info) || info.Size() < state.offset {
++		state.offset = 0
++		state.info = info
++	}
++	if info.Size() == state.offset {
++		return nil
++	}
++
++	file, err := os.Open(state.path)
++	if err != nil {
++		return err
++	}
++	defer file.Close()
++	if _, err := file.Seek(state.offset, io.SeekStart); err != nil {
++		return err
++	}
++	scanner := bufio.NewScanner(file)
++	scanner.Buffer(make([]byte, 4096), 64*1024)
++	for scanner.Scan() {
++		if event, ok := parseAcceptedSSHLogin(scanner.Text()); ok {
++			if err := reportAcceptedSSHLogin(event); err != nil {
++				log.Printf("failed to report successful SSH login: %v", err)
++			}
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return err
++	}
++	state.offset, err = file.Seek(0, io.SeekCurrent)
++	return err
++}
++
++type acceptedSSHLogin struct {
++	user       string
++	remoteIP   string
++	remotePort int
++	authMethod string
++	occurredAt time.Time
++}
++
++func parseAcceptedSSHLogin(line string) (acceptedSSHLogin, bool) {
++	match := acceptedSSHLoginPattern.FindStringSubmatch(line)
++	if len(match) != 5 || net.ParseIP(match[3]) == nil {
++		return acceptedSSHLogin{}, false
++	}
++	port, err := strconv.Atoi(match[4])
++	if err != nil || port < 1 || port > 65535 {
++		return acceptedSSHLogin{}, false
++	}
++	method := strings.ToLower(strings.SplitN(match[1], "/", 2)[0])
++	switch method {
++	case "publickey", "password", "keyboard-interactive", "hostbased":
++	default:
++		return acceptedSSHLogin{}, false
++	}
++	return acceptedSSHLogin{user: match[2], remoteIP: match[3], remotePort: port, authMethod: method, occurredAt: time.Now().UTC()}, true
++}
++
++func reportAcceptedSSHLogin(event acceptedSSHLogin) error {
++	id := fmt.Sprintf("ssh-login-%d", event.occurredAt.UnixNano())
++	payload := v2.NewRequest(id, v2.MethodAgentSSHLogin, map[string]interface{}{
++		"user":        event.user,
++		"remote_ip":   event.remoteIP,
++		"remote_port": event.remotePort,
++		"auth_method": event.authMethod,
++		"occurred_at": event.occurredAt.Format(time.RFC3339Nano),
++	})
++	_, err := postV2Request(payload)
++	return err
++}
+diff --git a/server/ssh_login_watch_test.go b/server/ssh_login_watch_test.go
+new file mode 100644
+--- /dev/null
++++ b/server/ssh_login_watch_test.go
+@@ -0,0 +1,25 @@
++package server
++
++import "testing"
++
++func TestParseAcceptedSSHLogin(t *testing.T) {
++	tests := []struct {
++		line   string
++		ok     bool
++		method string
++	}{
++		{"Jun 21 host sshd[123]: Accepted publickey for root from 203.0.113.5 port 4567 ssh2", true, "publickey"},
++		{"Jun 21 host sshd[124]: Accepted keyboard-interactive/pam for admin from 2001:db8::5 port 22 ssh2", true, "keyboard-interactive"},
++		{"Jun 21 host sshd[125]: Failed password for root from 203.0.113.5 port 4567 ssh2", false, ""},
++		{"Jun 21 host sshd[126]: Accepted publickey for bad<user from 203.0.113.5 port 4567 ssh2", false, ""},
++	}
++	for _, test := range tests {
++		event, ok := parseAcceptedSSHLogin(test.line)
++		if ok != test.ok {
++			t.Fatalf("parse result for %q: got %v want %v", test.line, ok, test.ok)
++		}
++		if ok && event.authMethod != test.method {
++			t.Fatalf("method for %q: got %q want %q", test.line, event.authMethod, test.method)
++		}
++	}
++}

@@ -33,6 +33,14 @@ jobs:
             echo "Unexpected remote-control function found; refusing to build."
             exit 1
           fi
+          if grep -R --line-number --include='*.go' -E 'case[[:space:]]+v2\.MethodAgent(Exec|Terminal)|"os/exec"|exec\.Command' server; then
+            echo "Unexpected command-execution path found in the server package; refusing to build."
+            exit 1
+          fi
+          grep -q 'capabilities.*\[\]string{"ping"}' server/websocket.go || {
+            echo "Agent capability list is broader than the reviewed TCP-ping-only policy."
+            exit 1
+          }
           gofmt -w cmd server
           go build ./...
 

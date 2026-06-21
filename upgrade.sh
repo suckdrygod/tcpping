@@ -9,6 +9,7 @@ DROPIN_DIR="/etc/systemd/system/${SERVICE}.d"
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo 'Run as root or with sudo.' >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { echo 'curl is required.' >&2; exit 1; }
+command -v sha256sum >/dev/null 2>&1 || { echo 'sha256sum is required.' >&2; exit 1; }
 systemctl cat "$SERVICE" >/dev/null 2>&1 || { echo "$SERVICE is not installed." >&2; exit 1; }
 
 case "$(uname -m)" in
@@ -34,12 +35,19 @@ timezone="${timezone:-Etc/UTC}"
 }
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
-url="https://github.com/${REPO}/releases/latest/download/komari-agent-linux-${arch}"
+sumtmp="$(mktemp)"
+trap 'rm -f "$tmp" "$sumtmp"' EXIT
+asset="komari-agent-linux-${arch}"
+url="https://github.com/${REPO}/releases/latest/download/${asset}"
+checksums_url="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
 echo "Downloading latest TCP-safe agent for ${arch}..."
 curl -fL --proto '=https' --tlsv1.2 \
   --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
   "$url" -o "$tmp"
+curl -fsSL --proto '=https' --tlsv1.2 \
+  --retry 8 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+  "$checksums_url" -o "$sumtmp"
+(cd "$(dirname "$tmp")" && grep -E "  ${asset}$" "$sumtmp" | sed "s#  ${asset}\$#  $(basename "$tmp")#" | sha256sum -c -)
 chmod 0755 "$tmp"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -53,6 +61,7 @@ mkdir -p "$DROPIN_DIR"
 cat >"$DROPIN_DIR/10-traffic-reset-timezone.conf" <<EOF
 [Service]
 Environment=TZ=${timezone}
+Environment=AGENT_SSH_LOGIN_NOTIFY=true
 EOF
 
 systemctl daemon-reload

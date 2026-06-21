@@ -17,6 +17,11 @@ The agent accepts an `agent.ping` task only when all of these conditions hold:
 - Loopback, RFC1918, CGNAT, link-local, multicast, unspecified, benchmark, documentation, and other reserved IPv4 ranges are rejected.
 - The agent has not exceeded `--safe-tcp-max-tasks-per-minute`.
 
+CI refuses to build if a server-side exec/terminal handler, `os/exec` use, or a
+capability broader than constrained TCP ping appears in the patched agent.
+Install and upgrade scripts verify the downloaded binary against the release
+`SHA256SUMS` before replacing the running root-owned binary.
+
 The default policy is deliberately narrow:
 
 ```text
@@ -33,6 +38,7 @@ That default works with targets such as `zj-cm-v4.ip.zstaticcdn.com:80` while bl
 | Capability | Status |
 |---|---:|
 | CPU / RAM / disk / traffic monitoring | enabled |
+| Successful SSH login notification | enabled, read-only log tail |
 | TCP latency task | enabled, allow-listed |
 | ICMP latency task | removed |
 | HTTP latency task | removed |
@@ -92,6 +98,12 @@ curl -fsSL https://raw.githubusercontent.com/suckdrygod/tcpping/main/upgrade.sh 
 The upgrade keeps the existing service arguments, including `--month-rotate`,
 and adds a small systemd timezone drop-in so the reported timezone exactly
 matches the reset boundary used by the agent.
+
+The same drop-in enables successful SSH login notifications. The agent reads
+new `Accepted ...` records from `/var/log/auth.log` or `/var/log/secure` and
+sends only user, source IP/port, authentication method, and timestamp to the
+panel. It never receives or executes SSH commands. Disable it with a systemd
+override setting `AGENT_SSH_LOGIN_NOTIFY=false`.
 
 The installer creates/updates the `komari-agent.service` service, makes a timestamped backup of an existing `/opt/komari/agent`, and uses the safety defaults above.
 
