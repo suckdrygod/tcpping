@@ -606,17 +606,19 @@ index 0000000..8d5cf5e
 +}
 diff --git a/server/vnstat.go b/server/vnstat.go
 new file mode 100644
-index 0000000..d6e8c6f
+index 0000000..59768a9
 --- /dev/null
 +++ b/server/vnstat.go
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,171 @@
 +package server
 +
 +import (
 +	"context"
 +	"encoding/json"
 +	"log"
++	"os"
 +	"os/exec"
++	"strings"
 +	"time"
 +)
 +
@@ -703,10 +705,28 @@ index 0000000..d6e8c6f
 +}
 +
 +func selectVnstatInterface(interfaces []vnstatInterface) (vnstatInterface, bool) {
++	if defaultIface := defaultRouteInterface(); defaultIface != "" {
++		for _, iface := range interfaces {
++			if iface.Name == defaultIface {
++				return iface, true
++			}
++		}
++	}
++
++	if iface, ok := selectLargestVnstatInterface(interfaces, true); ok {
++		return iface, true
++	}
++	return selectLargestVnstatInterface(interfaces, false)
++}
++
++func selectLargestVnstatInterface(interfaces []vnstatInterface, skipVirtual bool) (vnstatInterface, bool) {
 +	var selected vnstatInterface
 +	found := false
 +	var selectedTotal int64
 +	for _, iface := range interfaces {
++		if skipVirtual && isLikelyVirtualInterface(iface.Name) {
++			continue
++		}
 +		total := iface.Traffic.Total.Rx + iface.Traffic.Total.Tx
 +		if !found || total > selectedTotal {
 +			selected = iface
@@ -716,17 +736,68 @@ index 0000000..d6e8c6f
 +	}
 +	return selected, found
 +}
++
++var procNetRoutePath = "/proc/net/route"
++
++func defaultRouteInterface() string {
++	raw, err := os.ReadFile(procNetRoutePath)
++	if err != nil {
++		return ""
++	}
++	lines := strings.Split(string(raw), "\n")
++	for _, line := range lines[1:] {
++		fields := strings.Fields(line)
++		if len(fields) < 4 {
++			continue
++		}
++		if fields[1] != "00000000" {
++			continue
++		}
++		return fields[0]
++	}
++	return ""
++}
++
++func isLikelyVirtualInterface(name string) bool {
++	name = strings.ToLower(strings.TrimSpace(name))
++	if name == "" {
++		return true
++	}
++	virtualPrefixes := []string{
++		"br-",
++		"docker",
++		"veth",
++		"virbr",
++		"lo",
++		"tun",
++		"tap",
++		"wg",
++		"tailscale",
++	}
++	for _, prefix := range virtualPrefixes {
++		if strings.HasPrefix(name, prefix) {
++			return true
++		}
++	}
++	return false
++}
 diff --git a/server/vnstat_test.go b/server/vnstat_test.go
 new file mode 100644
-index 0000000..e5ac13e
+index 0000000..05af618
 --- /dev/null
 +++ b/server/vnstat_test.go
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,98 @@
 +package server
 +
-+import "testing"
++import (
++	"os"
++	"testing"
++)
 +
 +func TestSelectVnstatInterfaceUsesLargestTotal(t *testing.T) {
++	procNetRoutePath = t.TempDir() + "/missing"
++	t.Cleanup(func() { procNetRoutePath = "/proc/net/route" })
++
 +	iface, ok := selectVnstatInterface([]vnstatInterface{
 +		{
 +			Name: "eth0",
@@ -753,6 +824,65 @@ index 0000000..e5ac13e
 +func TestSelectVnstatInterfaceHandlesEmptyList(t *testing.T) {
 +	if _, ok := selectVnstatInterface(nil); ok {
 +		t.Fatal("expected no interface to be selected")
++	}
++}
++
++func TestSelectVnstatInterfacePrefersDefaultRoute(t *testing.T) {
++	routeFile := t.TempDir() + "/route"
++	err := os.WriteFile(routeFile, []byte("Iface\tDestination\tGateway\tFlags\neth0\t00000000\t01020304\t0003\n"), 0o600)
++	if err != nil {
++		t.Fatal(err)
++	}
++	procNetRoutePath = routeFile
++	t.Cleanup(func() { procNetRoutePath = "/proc/net/route" })
++
++	iface, ok := selectVnstatInterface([]vnstatInterface{
++		{
++			Name: "br-1234",
++			Traffic: vnstatTraffic{
++				Total: vnstatCounter{Rx: 1000, Tx: 1000},
++			},
++		},
++		{
++			Name: "eth0",
++			Traffic: vnstatTraffic{
++				Total: vnstatCounter{Rx: 1, Tx: 1},
++			},
++		},
++	})
++
++	if !ok {
++		t.Fatal("expected an interface to be selected")
++	}
++	if iface.Name != "eth0" {
++		t.Fatalf("expected eth0, got %s", iface.Name)
++	}
++}
++
++func TestSelectVnstatInterfaceSkipsVirtualWhenNoDefaultRoute(t *testing.T) {
++	procNetRoutePath = t.TempDir() + "/missing"
++	t.Cleanup(func() { procNetRoutePath = "/proc/net/route" })
++
++	iface, ok := selectVnstatInterface([]vnstatInterface{
++		{
++			Name: "br-1234",
++			Traffic: vnstatTraffic{
++				Total: vnstatCounter{Rx: 1000, Tx: 1000},
++			},
++		},
++		{
++			Name: "eth0",
++			Traffic: vnstatTraffic{
++				Total: vnstatCounter{Rx: 1, Tx: 1},
++			},
++		},
++	})
++
++	if !ok {
++		t.Fatal("expected an interface to be selected")
++	}
++	if iface.Name != "eth0" {
++		t.Fatalf("expected eth0, got %s", iface.Name)
 +	}
 +}
 diff --git a/server/websocket.go b/server/websocket.go
