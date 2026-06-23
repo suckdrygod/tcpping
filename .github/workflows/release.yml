@@ -40,7 +40,7 @@ jobs:
           fi
           exec_hits="$(grep -R --line-number --include='*.go' -E '"os/exec"|exec\.Command' server || true)"
           if [ -n "$exec_hits" ]; then
-            unexpected_exec_hits="$(printf '%s\n' "$exec_hits" | grep -v 'server/vnstat.go:.*"os/exec"' | grep -v 'server/vnstat.go:.*exec.CommandContext(ctx, "vnstat", "--json")' | grep -v 'server/ssh_login_watch.go:.*"os/exec"' | grep -v 'server/ssh_login_watch.go:.*exec.CommandContext(ctx, "journalctl", "-f", "-n", "0", "-o", "cat")' || true)"
+            unexpected_exec_hits="$(printf '%s\n' "$exec_hits" | grep -v 'server/vnstat.go:.*"os/exec"' | grep -v 'server/vnstat.go:.*exec.CommandContext(ctx, "vnstat", "--json")' | grep -v 'server/ssh_login_watch.go:.*"os/exec"' | grep -v 'server/ssh_login_watch.go:.*exec.CommandContext(ctx, "journalctl", "-f", "-n", "0", "-o", "cat")' | grep -v 'server/ssh_auth_guard.go:.*"os/exec"' | grep -v 'server/ssh_auth_guard.go:.*exec.CommandContext(ctx, "journalctl", "-u", "ssh", "-u", "sshd", "-f", "-o", "short-iso")' || true)"
             if [ -n "$unexpected_exec_hits" ]; then
               printf '%s\n' "$unexpected_exec_hits"
               echo "Unexpected command-execution path found in the server package; refusing to build."
@@ -52,6 +52,7 @@ jobs:
             exit 1
           }
           gofmt -w cmd server
+          go test ./server ./cmd/flags
           go build ./...
 
       - name: Build Linux release binaries
