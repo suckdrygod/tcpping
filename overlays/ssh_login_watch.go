@@ -17,7 +17,7 @@ import (
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 )
 
-var acceptedSSHLoginPattern = regexp.MustCompile(`sshd(?:\[[0-9]+\])?: Accepted ([^ ]+) for ([A-Za-z0-9._-]+) from ([0-9A-Fa-f:.]+) port ([0-9]+)`)
+var acceptedSSHLoginPattern = regexp.MustCompile(`(?:sshd(?:\[[0-9]+\])?: )?Accepted ([^ ]+) for ([A-Za-z0-9._-]+) from ([0-9A-Fa-f:.]+) port ([0-9]+)`)
 
 type sshLogState struct {
 	path   string
