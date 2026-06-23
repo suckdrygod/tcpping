@@ -19,9 +19,10 @@ The agent accepts an `agent.ping` task only when all of these conditions hold:
 
 CI refuses to build if a server-side exec/terminal handler, unexpected
 `os/exec` use, or a capability broader than constrained TCP ping appears in the
-patched agent. The only allowed command execution path is the fixed local
-`vnstat --json` reader used for optional traffic accounting; panel input never
-reaches that command.
+patched agent. The only allowed command execution paths are the fixed local
+`vnstat --json` reader used for optional traffic accounting and the fixed
+read-only `journalctl -f -n 0 -o cat` SSH-login log fallback; panel input never
+reaches either command.
 Install and upgrade scripts verify the downloaded binary against the release
 `SHA256SUMS` before replacing the running root-owned binary.
 
@@ -120,10 +121,12 @@ and adds a small systemd timezone drop-in so the reported timezone exactly
 matches the reset boundary used by the agent.
 
 The same drop-in enables successful SSH login notifications. The agent reads
-new `Accepted ...` records from `/var/log/auth.log` or `/var/log/secure` and
-sends only user, source IP/port, authentication method, and timestamp to the
-panel. It never receives or executes SSH commands. Disable it with a systemd
-override setting `AGENT_SSH_LOGIN_NOTIFY=false`.
+new `Accepted ...` records from `/var/log/auth.log` or `/var/log/secure`. If
+neither file exists, it falls back to following systemd journal through the
+fixed read-only command `journalctl -f -n 0 -o cat`. It sends only user, source
+IP/port, authentication method, and timestamp to the panel. It never receives
+or executes SSH commands. Disable it with a systemd override setting
+`AGENT_SSH_LOGIN_NOTIFY=false`.
 
 The installer creates/updates the `komari-agent.service` service, makes a timestamped backup of an existing `/opt/komari/agent`, and uses the safety defaults above.
 
