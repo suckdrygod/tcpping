@@ -62,6 +62,8 @@ cat >"$DROPIN_DIR/10-traffic-reset-timezone.conf" <<EOF
 [Service]
 Environment=TZ=${timezone}
 Environment=AGENT_SSH_LOGIN_NOTIFY=true
+Environment=AGENT_SECURITY_ACTION_SYNC=true
+Environment=AGENT_SECURITY_ACTION_INTERVAL=15
 EOF
 
 systemctl daemon-reload
@@ -71,3 +73,4 @@ systemctl --no-pager --full status "$SERVICE"
 echo
 echo "Agent upgraded. Traffic reset timezone: ${timezone}"
 echo 'The existing endpoint, token, month-rotate day, and TCP allow-list were preserved.'
+echo 'Panel queued security ban/unban sync is enabled (fixed nftables actions only).'

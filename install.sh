@@ -29,6 +29,8 @@ ssh_auth_ban_duration='3600'
 ssh_auth_ban_whitelist=''
 ssh_auth_ban_mode='nftables'
 ssh_auth_ban_dry_run='false'
+security_action_sync='true'
+security_action_interval='15'
 
 agent_args_extra=()
 
@@ -80,6 +82,8 @@ SSH Auth Guard:
       --ssh-auth-ban-duration SEC    Ban duration (default: 3600)
       --ssh-auth-ban-whitelist LIST  Ban whitelist, single IP or CIDR
       --ssh-auth-ban-dry-run         Log intended bans without applying nftables
+      --disable-security-action-sync Disable panel queued ban/unban polling
+      --security-action-interval SEC Panel action polling interval, 5-3600 (default: 15)
 
 Other:
       --repo OWNER/REPO              Release repository override
@@ -143,6 +147,8 @@ while [[ $# -gt 0 ]]; do
     --ssh-auth-ban-whitelist) ssh_auth_ban_whitelist="$(need_value "$1" "${2:-}")"; shift 2 ;;
     --ssh-auth-ban-mode) ssh_auth_ban_mode="$(need_value "$1" "${2:-}")"; shift 2 ;;
     --ssh-auth-ban-dry-run) ssh_auth_ban_dry_run='true'; shift ;;
+    --disable-security-action-sync) security_action_sync='false'; shift ;;
+    --security-action-interval) security_action_interval="$(need_value "$1" "${2:-}")"; shift 2 ;;
 
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -165,6 +171,7 @@ fi
 [[ "$ssh_auth_ban_after" =~ ^[0-9]+$ ]] && (( ssh_auth_ban_after >= 1 && ssh_auth_ban_after <= 10000 )) || { echo 'Invalid --ssh-auth-ban-after.' >&2; exit 2; }
 [[ "$ssh_auth_ban_duration" =~ ^[0-9]+$ ]] && (( ssh_auth_ban_duration >= 60 && ssh_auth_ban_duration <= 86400 )) || { echo 'Invalid --ssh-auth-ban-duration.' >&2; exit 2; }
 [[ "$ssh_auth_ban_mode" == 'nftables' ]] || { echo 'Invalid --ssh-auth-ban-mode: only nftables is supported.' >&2; exit 2; }
+[[ "$security_action_interval" =~ ^[0-9]+$ ]] && (( security_action_interval >= 5 && security_action_interval <= 3600 )) || { echo 'Invalid --security-action-interval.' >&2; exit 2; }
 
 if [[ -z "$timezone" ]]; then
   if command -v timedatectl >/dev/null 2>&1; then
@@ -241,6 +248,9 @@ if [[ -n "$auto_discovery" ]]; then
   agent_args+=(--auto-discovery "$auto_discovery")
 fi
 agent_args+=(--disable-auto-update --month-rotate "$month_rotate")
+if [[ "$security_action_sync" == 'true' ]]; then
+  agent_args+=(--security-action-sync --security-action-interval "$security_action_interval")
+fi
 if [[ -n "$safe_tcp_allow_hosts" ]]; then
   agent_args+=(--safe-tcp-allow-hosts "$safe_tcp_allow_hosts")
 fi
