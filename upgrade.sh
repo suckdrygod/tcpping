@@ -66,6 +66,17 @@ Environment=AGENT_SECURITY_ACTION_SYNC=true
 Environment=AGENT_SECURITY_ACTION_INTERVAL=15
 EOF
 
+cat >"$DROPIN_DIR/99-silent-security-mode.conf" <<EOF
+[Service]
+Environment=AGENT_SSH_AUTH_GUARD=true
+Environment=AGENT_SSH_AUTH_SILENT_MODE=true
+Environment=AGENT_SSH_AUTH_AGGREGATE_BY_IP=true
+Environment=AGENT_SSH_AUTH_THRESHOLD=5
+Environment=AGENT_SSH_AUTH_WINDOW=60
+Environment=AGENT_SSH_AUTH_COOLDOWN=1800
+Environment=AGENT_SSH_AUTH_BAN_ENABLE=false
+EOF
+
 systemctl daemon-reload
 systemctl restart "$SERVICE"
 systemctl --no-pager --full status "$SERVICE"
@@ -74,3 +85,4 @@ echo
 echo "Agent upgraded. Traffic reset timezone: ${timezone}"
 echo 'The existing endpoint, token, month-rotate day, and TCP allow-list were preserved.'
 echo 'Panel queued security ban/unban sync is enabled (fixed nftables actions only).'
+echo 'SSH Auth Guard silent security mode is enabled; automatic ban remains disabled.'

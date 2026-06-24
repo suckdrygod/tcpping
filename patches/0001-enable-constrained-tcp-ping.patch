@@ -1,8 +1,8 @@
 diff --git a/cmd/flags/flag.go b/cmd/flags/flag.go
-index d8f79cc..2a3af43 100644
+index d8f79cc..10006a9 100644
 --- a/cmd/flags/flag.go
 +++ b/cmd/flags/flag.go
-@@ -29,6 +29,26 @@ type Config struct {
+@@ -29,6 +29,27 @@ type Config struct {
  	ProtocolVersion      int     `json:"protocol_version" env:"AGENT_PROTOCOL_VERSION"`               // 上报协议版本，默认2
  	DisableCompression   bool    `json:"disable_compression" env:"AGENT_DISABLE_COMPRESSION"`         // 禁用v2传输压缩
  	PreferIPVersion      string  `json:"prefer_ip_version" env:"AGENT_PREFER_IP_VERSION"`             // 面板连接优先使用的 IP 版本：4 或 6
@@ -13,6 +13,7 @@ index d8f79cc..2a3af43 100644
 +	SafeTCPMaxTasksPerMinute int    `json:"safe_tcp_max_tasks_per_minute" env:"AGENT_SAFE_TCP_MAX_TASKS_PER_MINUTE"` // Sliding-window task limit
 +	SSHLoginNotify           bool   `json:"ssh_login_notify" env:"AGENT_SSH_LOGIN_NOTIFY"`                           // Read-only successful SSH login notifications
 +	SSHAuthGuard             bool   `json:"ssh_auth_guard" env:"AGENT_SSH_AUTH_GUARD"`                               // Read-only SSH auth failure guard
++	SSHAuthSilentMode        bool   `json:"ssh_auth_silent_mode" env:"AGENT_SSH_AUTH_SILENT_MODE"`                   // Declarative panel-side silent mode marker; detection still runs
 +	SSHAuthThreshold         int    `json:"ssh_auth_threshold" env:"AGENT_SSH_AUTH_THRESHOLD"`                       // Failures required within the window
 +	SSHAuthWindowSeconds     int    `json:"ssh_auth_window_seconds" env:"AGENT_SSH_AUTH_WINDOW"`                     // Detection window in seconds
 +	SSHAuthCooldownSeconds   int    `json:"ssh_auth_cooldown_seconds" env:"AGENT_SSH_AUTH_COOLDOWN"`                 // Per source/user alert cooldown in seconds
@@ -30,7 +31,7 @@ index d8f79cc..2a3af43 100644
  }
  
 diff --git a/cmd/root.go b/cmd/root.go
-index 428f643..bb6a3e9 100644
+index 428f643..6cdd3c8 100644
 --- a/cmd/root.go
 +++ b/cmd/root.go
 @@ -56,6 +56,69 @@ var RootCmd = &cobra.Command{
@@ -133,7 +134,7 @@ index 428f643..bb6a3e9 100644
  		for {
  			server.UpdateBasicInfo()
  			server.EstablishWebSocketConnection()
-@@ -194,6 +263,25 @@ func init() {
+@@ -194,6 +263,27 @@ func init() {
  	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
  	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
  	RootCmd.PersistentFlags().StringVar(&flags.PreferIPVersion, "prefer-ip-version", "", "Prefer IP version for dashboard connections: 4 or 6")
@@ -143,12 +144,14 @@ index 428f643..bb6a3e9 100644
 +	RootCmd.PersistentFlags().IntVar(&flags.SafeTCPMaxTasksPerMinute, "safe-tcp-max-tasks-per-minute", 30, "Maximum accepted TCP probe tasks per minute (1-120)")
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHLoginNotify, "ssh-login-notify", false, "Send successful SSH login metadata to the panel")
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthGuard, "ssh-auth-guard", false, "Enable read-only SSH failed-login brute-force alerts")
++	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthSilentMode, "ssh-auth-silent-mode", false, "Declare panel-side SSH auth guard silent notification mode; detection still runs")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthThreshold, "ssh-auth-threshold", 5, "SSH auth failures required within the guard window")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthWindowSeconds, "ssh-auth-window", 60, "SSH auth guard detection window in seconds")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthCooldownSeconds, "ssh-auth-cooldown", 1800, "SSH auth guard per source/user alert cooldown in seconds")
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthRootOnly, "ssh-auth-root-only", false, "Only alert on root SSH auth failures")
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthAggregateByIP, "ssh-auth-aggregate-by-ip", false, "Aggregate SSH auth failures by source IP and merge attempted users")
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthBanEnable, "ssh-auth-ban-enable", false, "Enable local nftables SSH auth guard bans")
++	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthBanEnable, "ssh-auth-auto-ban", false, "Alias for --ssh-auth-ban-enable; disabled by default")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthBanAfter, "ssh-auth-ban-after", 5, "Failures required before local SSH auth guard ban")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthBanDuration, "ssh-auth-ban-duration", 3600, "Local SSH auth guard ban duration in seconds")
 +	RootCmd.PersistentFlags().StringVar(&flags.SSHAuthBanWhitelist, "ssh-auth-ban-whitelist", "", "Comma-separated single IP/CIDR list exempted from local bans")
@@ -720,10 +723,10 @@ index 0000000..4d02208
 +}
 diff --git a/server/ssh_auth_guard.go b/server/ssh_auth_guard.go
 new file mode 100644
-index 0000000..bf1ee8a
+index 0000000..bfe5605
 --- /dev/null
 +++ b/server/ssh_auth_guard.go
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,610 @@
 +package server
 +
 +import (
@@ -1045,6 +1048,14 @@ index 0000000..bf1ee8a
 +	bucket = append(bucket, failure)
 +	g.buckets[key] = bucket
 +
++	// Optional auto-ban is deliberately local-only and disabled by default.
++	// Password failures are noisy internet-wide, so when the operator explicitly
++	// enables auto-ban, drop the source immediately while keeping normal alert
++	// threshold/cooldown behavior for dashboard events.
++	if g.banPolicy != nil && g.banPolicy.ShouldBanImmediately(failure) {
++		_ = g.banPolicy.MaybeBan(failure.sourceIP, g.banPolicy.after, failure.occurredAt)
++	}
++
 +	if len(bucket) < g.threshold {
 +		return
 +	}
@@ -1166,6 +1177,10 @@ index 0000000..bf1ee8a
 +		}
 +	}
 +	return ranges
++}
++
++func (p *sshAuthBanPolicy) ShouldBanImmediately(failure sshAuthFailure) bool {
++	return p != nil && p.enabled && failure.method == "password"
 +}
 +
 +func (p *sshAuthBanPolicy) MaybeBan(sourceIP string, failedCount int, now time.Time) string {
@@ -1324,10 +1339,10 @@ index 0000000..bf1ee8a
 +}
 diff --git a/server/ssh_auth_guard_test.go b/server/ssh_auth_guard_test.go
 new file mode 100644
-index 0000000..b6f8304
+index 0000000..c45ddeb
 --- /dev/null
 +++ b/server/ssh_auth_guard_test.go
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,128 @@
 +package server
 +
 +import (
@@ -1422,6 +1437,22 @@ index 0000000..b6f8304
 +	}
 +}
 +
++func TestSSHAuthAutoBanPasswordImmediateButKeyUsesThreshold(t *testing.T) {
++	policy := &sshAuthBanPolicy{enabled: true, after: 5, duration: time.Hour, mode: "nftables", dryRun: true, bannedUntilByIP: make(map[string]time.Time)}
++	base := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
++	guard := newSSHAuthGuard(5, time.Minute, 10*time.Minute, false, true, policy, func(alert sshAuthGuardAlert) error { return nil })
++
++	guard.Observe(sshAuthFailure{sourceIP: "203.0.113.9", user: "root", method: "password", occurredAt: base})
++	if until, ok := policy.bannedUntilByIP["203.0.113.9"]; !ok || !until.After(base) {
++		t.Fatalf("password failure should be auto-banned immediately when auto-ban is enabled")
++	}
++
++	guard.Observe(sshAuthFailure{sourceIP: "203.0.113.10", user: "root", method: "publickey", occurredAt: base})
++	if _, ok := policy.bannedUntilByIP["203.0.113.10"]; ok {
++		t.Fatalf("publickey failure must not be auto-banned before threshold")
++	}
++}
++
 +func TestSSHAuthGuardRootOnly(t *testing.T) {
 +	var alerts []sshAuthGuardAlert
 +	guard := newSSHAuthGuard(2, time.Minute, 10*time.Minute, true, false, nil, func(alert sshAuthGuardAlert) error {
@@ -1438,246 +1469,6 @@ index 0000000..b6f8304
 +	guard.Observe(sshAuthFailure{sourceIP: "203.0.113.5", user: "root", method: "password", occurredAt: base.Add(time.Second)})
 +	if len(alerts) != 1 {
 +		t.Fatalf("root failures should trigger alert, got %d", len(alerts))
-+	}
-+}
-diff --git a/server/ssh_login_watch.go b/server/ssh_login_watch.go
-new file mode 100644
-index 0000000..9317c4a
---- /dev/null
-+++ b/server/ssh_login_watch.go
-@@ -0,0 +1,203 @@
-+package server
-+
-+import (
-+	"bufio"
-+	"context"
-+	"fmt"
-+	"io"
-+	"log"
-+	"net"
-+	"os"
-+	"os/exec"
-+	"regexp"
-+	"strconv"
-+	"strings"
-+	"time"
-+
-+	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
-+)
-+
-+var acceptedSSHLoginPattern = regexp.MustCompile(`(?:sshd(?:\[[0-9]+\])?: )?Accepted ([^ ]+) for ([A-Za-z0-9._-]+) from ([0-9A-Fa-f:.]+) port ([0-9]+)`)
-+
-+type sshLogState struct {
-+	path   string
-+	offset int64
-+	info   os.FileInfo
-+}
-+
-+// StartSSHLoginWatcher tails only successful OpenSSH authentication records.
-+// It never writes SSH configuration and never executes a command. Existing
-+// log contents are skipped on startup so an agent restart cannot replay old
-+// login events.
-+func StartSSHLoginWatcher(ctx context.Context) {
-+	paths := []string{"/var/log/auth.log", "/var/log/secure"}
-+	states := make(map[string]*sshLogState, len(paths))
-+	for _, path := range paths {
-+		if state := openSSHLogAtEnd(path); state != nil {
-+			states[path] = state
-+			log.Printf("SSH login notifier watching %s", path)
-+		}
-+	}
-+	if len(states) == 0 {
-+		log.Printf("SSH login notifier waiting for /var/log/auth.log or /var/log/secure")
-+		go watchSSHLoginJournal(ctx)
-+	}
-+
-+	ticker := time.NewTicker(2 * time.Second)
-+	defer ticker.Stop()
-+	for {
-+		select {
-+		case <-ctx.Done():
-+			return
-+		case <-ticker.C:
-+			for _, path := range paths {
-+				state := states[path]
-+				if state == nil {
-+					if next := openSSHLogAtEnd(path); next != nil {
-+						states[path] = next
-+						log.Printf("SSH login notifier watching %s", path)
-+					}
-+					continue
-+				}
-+				if err := pollSSHLog(state); err != nil && !os.IsNotExist(err) {
-+					log.Printf("SSH login notifier failed to read %s: %v", path, err)
-+				}
-+			}
-+		}
-+	}
-+}
-+
-+func watchSSHLoginJournal(ctx context.Context) {
-+	if _, err := exec.LookPath("journalctl"); err != nil {
-+		log.Printf("SSH login notifier journal fallback unavailable: journalctl not found")
-+		return
-+	}
-+	for {
-+		select {
-+		case <-ctx.Done():
-+			return
-+		default:
-+		}
-+		if err := runSSHLoginJournal(ctx); err != nil && ctx.Err() == nil {
-+			log.Printf("SSH login notifier journal fallback stopped: %v", err)
-+			select {
-+			case <-ctx.Done():
-+				return
-+			case <-time.After(5 * time.Second):
-+			}
-+		}
-+	}
-+}
-+
-+func runSSHLoginJournal(ctx context.Context) error {
-+	cmd := exec.CommandContext(ctx, "journalctl", "-f", "-n", "0", "-o", "cat")
-+	stdout, err := cmd.StdoutPipe()
-+	if err != nil {
-+		return err
-+	}
-+	cmd.Stderr = io.Discard
-+	if err := cmd.Start(); err != nil {
-+		return err
-+	}
-+	log.Printf("SSH login notifier watching systemd journal")
-+
-+	scanner := bufio.NewScanner(stdout)
-+	scanner.Buffer(make([]byte, 4096), 64*1024)
-+	for scanner.Scan() {
-+		if event, ok := parseAcceptedSSHLogin(scanner.Text()); ok {
-+			if err := reportAcceptedSSHLogin(event); err != nil {
-+				log.Printf("failed to report successful SSH login: %v", err)
-+			}
-+		}
-+	}
-+	scanErr := scanner.Err()
-+	waitErr := cmd.Wait()
-+	if scanErr != nil {
-+		return scanErr
-+	}
-+	return waitErr
-+}
-+
-+func openSSHLogAtEnd(path string) *sshLogState {
-+	info, err := os.Stat(path)
-+	if err != nil || !info.Mode().IsRegular() {
-+		return nil
-+	}
-+	return &sshLogState{path: path, offset: info.Size(), info: info}
-+}
-+
-+func pollSSHLog(state *sshLogState) error {
-+	info, err := os.Stat(state.path)
-+	if err != nil {
-+		return err
-+	}
-+	if !os.SameFile(state.info, info) || info.Size() < state.offset {
-+		state.offset = 0
-+		state.info = info
-+	}
-+	if info.Size() == state.offset {
-+		return nil
-+	}
-+
-+	file, err := os.Open(state.path)
-+	if err != nil {
-+		return err
-+	}
-+	defer file.Close()
-+	if _, err := file.Seek(state.offset, io.SeekStart); err != nil {
-+		return err
-+	}
-+	scanner := bufio.NewScanner(file)
-+	scanner.Buffer(make([]byte, 4096), 64*1024)
-+	for scanner.Scan() {
-+		if event, ok := parseAcceptedSSHLogin(scanner.Text()); ok {
-+			if err := reportAcceptedSSHLogin(event); err != nil {
-+				log.Printf("failed to report successful SSH login: %v", err)
-+			}
-+		}
-+	}
-+	if err := scanner.Err(); err != nil {
-+		return err
-+	}
-+	state.offset, err = file.Seek(0, io.SeekCurrent)
-+	return err
-+}
-+
-+type acceptedSSHLogin struct {
-+	user       string
-+	remoteIP   string
-+	remotePort int
-+	authMethod string
-+	occurredAt time.Time
-+}
-+
-+func parseAcceptedSSHLogin(line string) (acceptedSSHLogin, bool) {
-+	match := acceptedSSHLoginPattern.FindStringSubmatch(line)
-+	if len(match) != 5 || net.ParseIP(match[3]) == nil {
-+		return acceptedSSHLogin{}, false
-+	}
-+	port, err := strconv.Atoi(match[4])
-+	if err != nil || port < 1 || port > 65535 {
-+		return acceptedSSHLogin{}, false
-+	}
-+	method := strings.ToLower(strings.SplitN(match[1], "/", 2)[0])
-+	switch method {
-+	case "publickey", "password", "keyboard-interactive", "hostbased":
-+	default:
-+		return acceptedSSHLogin{}, false
-+	}
-+	return acceptedSSHLogin{user: match[2], remoteIP: match[3], remotePort: port, authMethod: method, occurredAt: time.Now().UTC()}, true
-+}
-+
-+func reportAcceptedSSHLogin(event acceptedSSHLogin) error {
-+	id := fmt.Sprintf("ssh-login-%d", event.occurredAt.UnixNano())
-+	payload := v2.NewRequest(id, v2.MethodAgentSSHLogin, map[string]interface{}{
-+		"user":        event.user,
-+		"remote_ip":   event.remoteIP,
-+		"remote_port": event.remotePort,
-+		"auth_method": event.authMethod,
-+		"occurred_at": event.occurredAt.Format(time.RFC3339Nano),
-+	})
-+	_, err := postV2Request(payload)
-+	return err
-+}
-diff --git a/server/ssh_login_watch_test.go b/server/ssh_login_watch_test.go
-new file mode 100644
-index 0000000..8d5cf5e
---- /dev/null
-+++ b/server/ssh_login_watch_test.go
-@@ -0,0 +1,25 @@
-+package server
-+
-+import "testing"
-+
-+func TestParseAcceptedSSHLogin(t *testing.T) {
-+	tests := []struct {
-+		line   string
-+		ok     bool
-+		method string
-+	}{
-+		{"Jun 21 host sshd[123]: Accepted publickey for root from 203.0.113.5 port 4567 ssh2", true, "publickey"},
-+		{"Jun 21 host sshd[124]: Accepted keyboard-interactive/pam for admin from 2001:db8::5 port 22 ssh2", true, "keyboard-interactive"},
-+		{"Jun 21 host sshd[125]: Failed password for root from 203.0.113.5 port 4567 ssh2", false, ""},
-+		{"Jun 21 host sshd[126]: Accepted publickey for bad<user from 203.0.113.5 port 4567 ssh2", false, ""},
-+	}
-+	for _, test := range tests {
-+		event, ok := parseAcceptedSSHLogin(test.line)
-+		if ok != test.ok {
-+			t.Fatalf("parse result for %q: got %v want %v", test.line, ok, test.ok)
-+		}
-+		if ok && event.authMethod != test.method {
-+			t.Fatalf("method for %q: got %q want %q", test.line, event.authMethod, test.method)
-+		}
 +	}
 +}
 diff --git a/server/vnstat.go b/server/vnstat.go

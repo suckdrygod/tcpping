@@ -18,6 +18,7 @@ safe_tcp_timeout=''
 safe_tcp_rate=''
 
 ssh_auth_guard='false'
+ssh_auth_silent_mode='false'
 ssh_auth_aggregate_by_ip='true'
 ssh_auth_threshold='5'
 ssh_auth_window='60'
@@ -71,6 +72,7 @@ TCP-safe policy overrides:
 
 SSH Auth Guard:
       --ssh-auth-guard               Enable SSH failed-login brute-force alerts
+      --ssh-auth-silent-mode         Keep detection on; panel controls notification silence
       --ssh-auth-aggregate-by-ip     Merge users by source IP (default when guard is enabled)
       --ssh-auth-no-aggregate-by-ip  Keep legacy source IP + user aggregation
       --ssh-auth-threshold N         Failures required within window (default: 5)
@@ -78,6 +80,7 @@ SSH Auth Guard:
       --ssh-auth-cooldown SECONDS    Alert cooldown (default: 1800)
       --ssh-auth-root-only           Only alert on root failures
       --ssh-auth-ban-enable          Enable local nftables ban (default: off)
+      --ssh-auth-auto-ban            Alias for --ssh-auth-ban-enable (default: off)
       --ssh-auth-ban-after N         Failures before local ban (default: 5)
       --ssh-auth-ban-duration SEC    Ban duration (default: 3600)
       --ssh-auth-ban-whitelist LIST  Ban whitelist, single IP or CIDR
@@ -96,6 +99,15 @@ need_value() {
   local value="${2:-}"
   [[ -n "$value" ]] || { echo "Missing value for ${name}." >&2; exit 2; }
   printf '%s' "$value"
+}
+
+need_bool() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    true|false) printf '%s' "$value" ;;
+    *) echo "Invalid value for ${name}: expected true or false." >&2; exit 2 ;;
+  esac
 }
 
 while [[ $# -gt 0 ]]; do
@@ -135,18 +147,32 @@ while [[ $# -gt 0 ]]; do
     --safe-tcp-timeout) safe_tcp_timeout="$(need_value "$1" "${2:-}")"; shift 2 ;;
     --safe-tcp-rate) safe_tcp_rate="$(need_value "$1" "${2:-}")"; shift 2 ;;
     --ssh-auth-guard) ssh_auth_guard='true'; shift ;;
+    --ssh-auth-guard=*) ssh_auth_guard="$(need_bool "--ssh-auth-guard" "${1#*=}")"; shift ;;
+    --ssh-auth-silent-mode) ssh_auth_silent_mode='true'; shift ;;
+    --ssh-auth-silent-mode=*) ssh_auth_silent_mode="$(need_bool "--ssh-auth-silent-mode" "${1#*=}")"; shift ;;
     --ssh-auth-aggregate-by-ip) ssh_auth_aggregate_by_ip='true'; shift ;;
+    --ssh-auth-aggregate-by-ip=*) ssh_auth_aggregate_by_ip="$(need_bool "--ssh-auth-aggregate-by-ip" "${1#*=}")"; shift ;;
     --ssh-auth-no-aggregate-by-ip) ssh_auth_aggregate_by_ip='false'; shift ;;
     --ssh-auth-threshold) ssh_auth_threshold="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-threshold=*) ssh_auth_threshold="$(need_value "--ssh-auth-threshold" "${1#*=}")"; shift ;;
     --ssh-auth-window) ssh_auth_window="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-window=*) ssh_auth_window="$(need_value "--ssh-auth-window" "${1#*=}")"; shift ;;
     --ssh-auth-cooldown) ssh_auth_cooldown="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-cooldown=*) ssh_auth_cooldown="$(need_value "--ssh-auth-cooldown" "${1#*=}")"; shift ;;
     --ssh-auth-root-only) ssh_auth_root_only='true'; shift ;;
-    --ssh-auth-ban-enable) ssh_auth_ban_enable='true'; shift ;;
+    --ssh-auth-root-only=*) ssh_auth_root_only="$(need_bool "--ssh-auth-root-only" "${1#*=}")"; shift ;;
+    --ssh-auth-ban-enable|--ssh-auth-auto-ban) ssh_auth_ban_enable='true'; shift ;;
+    --ssh-auth-ban-enable=*|--ssh-auth-auto-ban=*) ssh_auth_ban_enable="$(need_bool "${1%%=*}" "${1#*=}")"; shift ;;
     --ssh-auth-ban-after) ssh_auth_ban_after="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-after=*) ssh_auth_ban_after="$(need_value "--ssh-auth-ban-after" "${1#*=}")"; shift ;;
     --ssh-auth-ban-duration) ssh_auth_ban_duration="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-duration=*) ssh_auth_ban_duration="$(need_value "--ssh-auth-ban-duration" "${1#*=}")"; shift ;;
     --ssh-auth-ban-whitelist) ssh_auth_ban_whitelist="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-whitelist=*) ssh_auth_ban_whitelist="$(need_value "--ssh-auth-ban-whitelist" "${1#*=}")"; shift ;;
     --ssh-auth-ban-mode) ssh_auth_ban_mode="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-mode=*) ssh_auth_ban_mode="$(need_value "--ssh-auth-ban-mode" "${1#*=}")"; shift ;;
     --ssh-auth-ban-dry-run) ssh_auth_ban_dry_run='true'; shift ;;
+    --ssh-auth-ban-dry-run=*) ssh_auth_ban_dry_run="$(need_bool "--ssh-auth-ban-dry-run" "${1#*=}")"; shift ;;
     --disable-security-action-sync) security_action_sync='false'; shift ;;
     --security-action-interval) security_action_interval="$(need_value "$1" "${2:-}")"; shift 2 ;;
 
@@ -265,6 +291,9 @@ if [[ -n "$safe_tcp_rate" ]]; then
 fi
 if [[ "$ssh_auth_guard" == 'true' ]]; then
   agent_args+=(--ssh-auth-guard --ssh-auth-threshold "$ssh_auth_threshold" --ssh-auth-window "$ssh_auth_window" --ssh-auth-cooldown "$ssh_auth_cooldown")
+  if [[ "$ssh_auth_silent_mode" == 'true' ]]; then
+    agent_args+=(--ssh-auth-silent-mode)
+  fi
   if [[ "$ssh_auth_aggregate_by_ip" == 'true' ]]; then
     agent_args+=(--ssh-auth-aggregate-by-ip)
   fi
