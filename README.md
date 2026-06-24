@@ -17,8 +17,12 @@ The agent accepts an `agent.ping` task only when all of these conditions hold:
 - Loopback, RFC1918, CGNAT, link-local, multicast, unspecified, benchmark, documentation, and other reserved IPv4 ranges are rejected.
 - The agent has not exceeded `--safe-tcp-max-tasks-per-minute`.
 
-CI refuses to build if a server-side exec/terminal handler, `os/exec` use, or a
-capability broader than constrained TCP ping appears in the patched agent.
+CI refuses to build if a server-side exec/terminal handler, unexpected
+`os/exec` use, or a capability broader than constrained TCP ping appears in the
+patched agent. The only allowed command execution paths are the fixed local
+`vnstat --json` reader used for optional traffic accounting and the fixed
+read-only `journalctl -f -n 0 -o cat` SSH-login log fallback; panel input never
+reaches either command.
 Install and upgrade scripts verify the downloaded binary against the release
 `SHA256SUMS` before replacing the running root-owned binary.
 
@@ -38,6 +42,7 @@ That default works with targets such as `zj-cm-v4.ip.zstaticcdn.com:80` while bl
 | Capability | Status |
 |---|---:|
 | CPU / RAM / disk / traffic monitoring | enabled |
+| Optional vnStat traffic accounting | enabled, fixed local `vnstat --json` read |
 | Successful SSH login notification | enabled, read-only log tail |
 | TCP latency task | enabled, allow-listed |
 | ICMP latency task | removed |
@@ -89,6 +94,22 @@ The agent reports the configured reset day and effective IANA timezone to a
 compatible Komari panel through its existing basic-info heartbeat. No extra
 daemon or detection tool is installed.
 
+For more accurate reboot-safe traffic accounting, install vnStat on each VPS
+before or after installing the agent:
+
+```bash
+sudo apt update
+sudo apt install -y vnstat
+sudo systemctl enable --now vnstat
+```
+
+When vnStat is present, the agent reports its local interface totals and daily
+buckets to compatible panels. During the first adoption cycle the panel uses
+the existing Komari counter as a baseline plus new vnStat growth; after the
+next configured reset day it uses vnStat daily accounting directly. If vnStat
+is absent, the agent keeps reporting normal Komari metrics and the panel falls
+back automatically.
+
 ### Upgrade an existing installation without entering its token again
 
 ```bash
@@ -100,10 +121,12 @@ and adds a small systemd timezone drop-in so the reported timezone exactly
 matches the reset boundary used by the agent.
 
 The same drop-in enables successful SSH login notifications. The agent reads
-new `Accepted ...` records from `/var/log/auth.log` or `/var/log/secure` and
-sends only user, source IP/port, authentication method, and timestamp to the
-panel. It never receives or executes SSH commands. Disable it with a systemd
-override setting `AGENT_SSH_LOGIN_NOTIFY=false`.
+new `Accepted ...` records from `/var/log/auth.log` or `/var/log/secure`. If
+neither file exists, it falls back to following systemd journal through the
+fixed read-only command `journalctl -f -n 0 -o cat`. It sends only user, source
+IP/port, authentication method, and timestamp to the panel. It never receives
+or executes SSH commands. Disable it with a systemd override setting
+`AGENT_SSH_LOGIN_NOTIFY=false`.
 
 The installer creates/updates the `komari-agent.service` service, makes a timestamped backup of an existing `/opt/komari/agent`, and uses the safety defaults above.
 
