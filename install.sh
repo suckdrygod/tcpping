@@ -17,6 +17,19 @@ safe_tcp_allow_ports=''
 safe_tcp_timeout=''
 safe_tcp_rate=''
 
+ssh_auth_guard='false'
+ssh_auth_aggregate_by_ip='true'
+ssh_auth_threshold='5'
+ssh_auth_window='60'
+ssh_auth_cooldown='1800'
+ssh_auth_root_only='false'
+ssh_auth_ban_enable='false'
+ssh_auth_ban_after='5'
+ssh_auth_ban_duration='3600'
+ssh_auth_ban_whitelist=''
+ssh_auth_ban_mode='nftables'
+ssh_auth_ban_dry_run='false'
+
 agent_args_extra=()
 
 usage() {
@@ -53,6 +66,20 @@ TCP-safe policy overrides:
       --safe-tcp-allow-ports LIST    Destination TCP ports
       --safe-tcp-timeout SECONDS     Per-probe timeout, 1-10
       --safe-tcp-rate PER_MINUTE     Accepted tasks per minute, 1-120
+
+SSH Auth Guard:
+      --ssh-auth-guard               Enable SSH failed-login brute-force alerts
+      --ssh-auth-aggregate-by-ip     Merge users by source IP (default when guard is enabled)
+      --ssh-auth-no-aggregate-by-ip  Keep legacy source IP + user aggregation
+      --ssh-auth-threshold N         Failures required within window (default: 5)
+      --ssh-auth-window SECONDS      Detection window (default: 60)
+      --ssh-auth-cooldown SECONDS    Alert cooldown (default: 1800)
+      --ssh-auth-root-only           Only alert on root failures
+      --ssh-auth-ban-enable          Enable local nftables ban (default: off)
+      --ssh-auth-ban-after N         Failures before local ban (default: 5)
+      --ssh-auth-ban-duration SEC    Ban duration (default: 3600)
+      --ssh-auth-ban-whitelist LIST  Ban whitelist, single IP or CIDR
+      --ssh-auth-ban-dry-run         Log intended bans without applying nftables
 
 Other:
       --repo OWNER/REPO              Release repository override
@@ -103,6 +130,19 @@ while [[ $# -gt 0 ]]; do
     --safe-tcp-allow-ports) safe_tcp_allow_ports="$(need_value "$1" "${2:-}")"; shift 2 ;;
     --safe-tcp-timeout) safe_tcp_timeout="$(need_value "$1" "${2:-}")"; shift 2 ;;
     --safe-tcp-rate) safe_tcp_rate="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-guard) ssh_auth_guard='true'; shift ;;
+    --ssh-auth-aggregate-by-ip) ssh_auth_aggregate_by_ip='true'; shift ;;
+    --ssh-auth-no-aggregate-by-ip) ssh_auth_aggregate_by_ip='false'; shift ;;
+    --ssh-auth-threshold) ssh_auth_threshold="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-window) ssh_auth_window="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-cooldown) ssh_auth_cooldown="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-root-only) ssh_auth_root_only='true'; shift ;;
+    --ssh-auth-ban-enable) ssh_auth_ban_enable='true'; shift ;;
+    --ssh-auth-ban-after) ssh_auth_ban_after="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-duration) ssh_auth_ban_duration="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-whitelist) ssh_auth_ban_whitelist="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-mode) ssh_auth_ban_mode="$(need_value "$1" "${2:-}")"; shift 2 ;;
+    --ssh-auth-ban-dry-run) ssh_auth_ban_dry_run='true'; shift ;;
 
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -119,6 +159,12 @@ fi
 if [[ -n "$safe_tcp_rate" ]]; then
   [[ "$safe_tcp_rate" =~ ^[0-9]+$ ]] && (( safe_tcp_rate >= 1 && safe_tcp_rate <= 120 )) || { echo 'Invalid --safe-tcp-rate.' >&2; exit 2; }
 fi
+[[ "$ssh_auth_threshold" =~ ^[0-9]+$ ]] && (( ssh_auth_threshold >= 1 && ssh_auth_threshold <= 1000 )) || { echo 'Invalid --ssh-auth-threshold.' >&2; exit 2; }
+[[ "$ssh_auth_window" =~ ^[0-9]+$ ]] && (( ssh_auth_window >= 1 && ssh_auth_window <= 3600 )) || { echo 'Invalid --ssh-auth-window.' >&2; exit 2; }
+[[ "$ssh_auth_cooldown" =~ ^[0-9]+$ ]] && (( ssh_auth_cooldown >= 1 && ssh_auth_cooldown <= 86400 )) || { echo 'Invalid --ssh-auth-cooldown.' >&2; exit 2; }
+[[ "$ssh_auth_ban_after" =~ ^[0-9]+$ ]] && (( ssh_auth_ban_after >= 1 && ssh_auth_ban_after <= 10000 )) || { echo 'Invalid --ssh-auth-ban-after.' >&2; exit 2; }
+[[ "$ssh_auth_ban_duration" =~ ^[0-9]+$ ]] && (( ssh_auth_ban_duration >= 60 && ssh_auth_ban_duration <= 86400 )) || { echo 'Invalid --ssh-auth-ban-duration.' >&2; exit 2; }
+[[ "$ssh_auth_ban_mode" == 'nftables' ]] || { echo 'Invalid --ssh-auth-ban-mode: only nftables is supported.' >&2; exit 2; }
 
 if [[ -z "$timezone" ]]; then
   if command -v timedatectl >/dev/null 2>&1; then
@@ -206,6 +252,24 @@ if [[ -n "$safe_tcp_timeout" ]]; then
 fi
 if [[ -n "$safe_tcp_rate" ]]; then
   agent_args+=(--safe-tcp-max-tasks-per-minute "$safe_tcp_rate")
+fi
+if [[ "$ssh_auth_guard" == 'true' ]]; then
+  agent_args+=(--ssh-auth-guard --ssh-auth-threshold "$ssh_auth_threshold" --ssh-auth-window "$ssh_auth_window" --ssh-auth-cooldown "$ssh_auth_cooldown")
+  if [[ "$ssh_auth_aggregate_by_ip" == 'true' ]]; then
+    agent_args+=(--ssh-auth-aggregate-by-ip)
+  fi
+  if [[ "$ssh_auth_root_only" == 'true' ]]; then
+    agent_args+=(--ssh-auth-root-only)
+  fi
+  if [[ "$ssh_auth_ban_enable" == 'true' ]]; then
+    agent_args+=(--ssh-auth-ban-enable --ssh-auth-ban-after "$ssh_auth_ban_after" --ssh-auth-ban-duration "$ssh_auth_ban_duration" --ssh-auth-ban-mode "$ssh_auth_ban_mode")
+    if [[ "$ssh_auth_ban_dry_run" == 'true' ]]; then
+      agent_args+=(--ssh-auth-ban-dry-run)
+    fi
+    if [[ -n "$ssh_auth_ban_whitelist" ]]; then
+      agent_args+=(--ssh-auth-ban-whitelist "$ssh_auth_ban_whitelist")
+    fi
+  fi
 fi
 agent_args+=("${agent_args_extra[@]}")
 

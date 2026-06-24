@@ -1,8 +1,8 @@
 diff --git a/cmd/flags/flag.go b/cmd/flags/flag.go
-index d8f79cc..e63521f 100644
+index d8f79cc..ed3471b 100644
 --- a/cmd/flags/flag.go
 +++ b/cmd/flags/flag.go
-@@ -29,6 +29,17 @@ type Config struct {
+@@ -29,6 +29,24 @@ type Config struct {
  	ProtocolVersion      int     `json:"protocol_version" env:"AGENT_PROTOCOL_VERSION"`               // 上报协议版本，默认2
  	DisableCompression   bool    `json:"disable_compression" env:"AGENT_DISABLE_COMPRESSION"`         // 禁用v2传输压缩
  	PreferIPVersion      string  `json:"prefer_ip_version" env:"AGENT_PREFER_IP_VERSION"`             // 面板连接优先使用的 IP 版本：4 或 6
@@ -17,14 +17,21 @@ index d8f79cc..e63521f 100644
 +	SSHAuthWindowSeconds     int    `json:"ssh_auth_window_seconds" env:"AGENT_SSH_AUTH_WINDOW"`                     // Detection window in seconds
 +	SSHAuthCooldownSeconds   int    `json:"ssh_auth_cooldown_seconds" env:"AGENT_SSH_AUTH_COOLDOWN"`                 // Per source/user alert cooldown in seconds
 +	SSHAuthRootOnly          bool   `json:"ssh_auth_root_only" env:"AGENT_SSH_AUTH_ROOT_ONLY"`                       // Only alert for root failures
++	SSHAuthAggregateByIP     bool   `json:"ssh_auth_aggregate_by_ip" env:"AGENT_SSH_AUTH_AGGREGATE_BY_IP"`           // Aggregate failures by source IP instead of source IP + user
++	SSHAuthBanEnable         bool   `json:"ssh_auth_ban_enable" env:"AGENT_SSH_AUTH_BAN_ENABLE"`                     // Enable local fixed-action nftables ban
++	SSHAuthBanAfter          int    `json:"ssh_auth_ban_after" env:"AGENT_SSH_AUTH_BAN_AFTER"`                       // Failures required before local ban
++	SSHAuthBanDuration       int    `json:"ssh_auth_ban_duration" env:"AGENT_SSH_AUTH_BAN_DURATION"`                 // Local ban duration in seconds
++	SSHAuthBanWhitelist      string `json:"ssh_auth_ban_whitelist" env:"AGENT_SSH_AUTH_BAN_WHITELIST"`               // Comma-separated single IP/CIDR local ban whitelist
++	SSHAuthBanMode           string `json:"ssh_auth_ban_mode" env:"AGENT_SSH_AUTH_BAN_MODE"`                         // Local ban mode, currently nftables only
++	SSHAuthBanDryRun         bool   `json:"ssh_auth_ban_dry_run" env:"AGENT_SSH_AUTH_BAN_DRY_RUN"`                   // Log intended ban without applying it
  
  }
  
 diff --git a/cmd/root.go b/cmd/root.go
-index 428f643..a80c921 100644
+index 428f643..53d495a 100644
 --- a/cmd/root.go
 +++ b/cmd/root.go
-@@ -56,6 +56,45 @@ var RootCmd = &cobra.Command{
+@@ -56,6 +56,63 @@ var RootCmd = &cobra.Command{
  		if flags.PreferIPVersion != "" && flags.PreferIPVersion != "4" && flags.PreferIPVersion != "6" {
  			return fmt.Errorf("invalid --prefer-ip-version value %q: expected 4 or 6", flags.PreferIPVersion)
  		}
@@ -56,7 +63,16 @@ index 428f643..a80c921 100644
 +			flags.SSHAuthWindowSeconds = 60
 +		}
 +		if flags.SSHAuthCooldownSeconds == 0 {
-+			flags.SSHAuthCooldownSeconds = 600
++			flags.SSHAuthCooldownSeconds = 1800
++		}
++		if flags.SSHAuthBanAfter == 0 {
++			flags.SSHAuthBanAfter = 5
++		}
++		if flags.SSHAuthBanDuration == 0 {
++			flags.SSHAuthBanDuration = 3600
++		}
++		if strings.TrimSpace(flags.SSHAuthBanMode) == "" {
++			flags.SSHAuthBanMode = "nftables"
 +		}
 +		if flags.SSHAuthThreshold < 1 || flags.SSHAuthThreshold > 1000 {
 +			return fmt.Errorf("invalid --ssh-auth-threshold: expected 1-1000")
@@ -67,10 +83,19 @@ index 428f643..a80c921 100644
 +		if flags.SSHAuthCooldownSeconds < 1 || flags.SSHAuthCooldownSeconds > 86400 {
 +			return fmt.Errorf("invalid --ssh-auth-cooldown: expected 1-86400 seconds")
 +		}
++		if flags.SSHAuthBanAfter < 1 || flags.SSHAuthBanAfter > 10000 {
++			return fmt.Errorf("invalid --ssh-auth-ban-after: expected 1-10000")
++		}
++		if flags.SSHAuthBanDuration < 60 || flags.SSHAuthBanDuration > 86400 {
++			return fmt.Errorf("invalid --ssh-auth-ban-duration: expected 60-86400 seconds")
++		}
++		if flags.SSHAuthBanMode != "nftables" {
++			return fmt.Errorf("invalid --ssh-auth-ban-mode: only nftables is supported")
++		}
  		// 捕获中止信号，优雅退出
  		stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
  		defer stop()
-@@ -121,15 +160,18 @@ var RootCmd = &cobra.Command{
+@@ -121,15 +178,18 @@ var RootCmd = &cobra.Command{
  		if flags.IgnoreUnsafeCert {
  			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
  		}
@@ -97,7 +122,7 @@ index 428f643..a80c921 100644
  		for {
  			server.UpdateBasicInfo()
  			server.EstablishWebSocketConnection()
-@@ -194,6 +236,16 @@ func init() {
+@@ -194,6 +254,23 @@ func init() {
  	RootCmd.PersistentFlags().IntVar(&flags.ProtocolVersion, "protocol-version", 2, "Report protocol version (1 or 2)")
  	RootCmd.PersistentFlags().BoolVar(&flags.DisableCompression, "disable-compression", false, "Disable v2 gzip/permessage-deflate compression")
  	RootCmd.PersistentFlags().StringVar(&flags.PreferIPVersion, "prefer-ip-version", "", "Prefer IP version for dashboard connections: 4 or 6")
@@ -109,8 +134,15 @@ index 428f643..a80c921 100644
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthGuard, "ssh-auth-guard", false, "Enable read-only SSH failed-login brute-force alerts")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthThreshold, "ssh-auth-threshold", 5, "SSH auth failures required within the guard window")
 +	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthWindowSeconds, "ssh-auth-window", 60, "SSH auth guard detection window in seconds")
-+	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthCooldownSeconds, "ssh-auth-cooldown", 600, "SSH auth guard per source/user alert cooldown in seconds")
++	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthCooldownSeconds, "ssh-auth-cooldown", 1800, "SSH auth guard per source/user alert cooldown in seconds")
 +	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthRootOnly, "ssh-auth-root-only", false, "Only alert on root SSH auth failures")
++	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthAggregateByIP, "ssh-auth-aggregate-by-ip", false, "Aggregate SSH auth failures by source IP and merge attempted users")
++	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthBanEnable, "ssh-auth-ban-enable", false, "Enable local nftables SSH auth guard bans")
++	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthBanAfter, "ssh-auth-ban-after", 5, "Failures required before local SSH auth guard ban")
++	RootCmd.PersistentFlags().IntVar(&flags.SSHAuthBanDuration, "ssh-auth-ban-duration", 3600, "Local SSH auth guard ban duration in seconds")
++	RootCmd.PersistentFlags().StringVar(&flags.SSHAuthBanWhitelist, "ssh-auth-ban-whitelist", "", "Comma-separated single IP/CIDR list exempted from local bans")
++	RootCmd.PersistentFlags().StringVar(&flags.SSHAuthBanMode, "ssh-auth-ban-mode", "nftables", "Local SSH auth guard ban mode (nftables)")
++	RootCmd.PersistentFlags().BoolVar(&flags.SSHAuthBanDryRun, "ssh-auth-ban-dry-run", false, "Log local SSH auth guard ban decisions without applying nftables")
  	RootCmd.PersistentFlags().ParseErrorsWhitelist.UnknownFlags = true
  }
  
@@ -450,10 +482,10 @@ index 0000000..13860ee
 +}
 diff --git a/server/ssh_auth_guard.go b/server/ssh_auth_guard.go
 new file mode 100644
-index 0000000..4f09e90
+index 0000000..83d40f4
 --- /dev/null
 +++ b/server/ssh_auth_guard.go
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,579 @@
 +package server
 +
 +import (
@@ -470,6 +502,7 @@ index 0000000..4f09e90
 +	"os/exec"
 +	"regexp"
 +	"strings"
++	"sync"
 +	"time"
 +	"unicode"
 +
@@ -500,17 +533,31 @@ index 0000000..4f09e90
 +	windowSeconds int
 +	occurredAt    time.Time
 +	sampleMessage string
++	banStatus     string
 +}
 +
 +type sshAuthGuard struct {
-+	threshold int
-+	window    time.Duration
-+	cooldown  time.Duration
-+	rootOnly  bool
-+	report    func(sshAuthGuardAlert) error
-+	now       func() time.Time
-+	buckets   map[string][]sshAuthFailure
-+	lastAlert map[string]time.Time
++	threshold     int
++	window        time.Duration
++	cooldown      time.Duration
++	rootOnly      bool
++	aggregateByIP bool
++	banPolicy     *sshAuthBanPolicy
++	report        func(sshAuthGuardAlert) error
++	now           func() time.Time
++	buckets       map[string][]sshAuthFailure
++	lastAlert     map[string]time.Time
++}
++
++type sshAuthBanPolicy struct {
++	enabled         bool
++	after           int
++	duration        time.Duration
++	mode            string
++	dryRun          bool
++	whitelist       []net.IPNet
++	bannedMu        sync.Mutex
++	bannedUntilByIP map[string]time.Time
 +}
 +
 +// StartSSHAuthGuard is a read-only, alert-only SSH authentication failure
@@ -537,12 +584,12 @@ index 0000000..4f09e90
 +	}
 +	cooldownSeconds := flags.SSHAuthCooldownSeconds
 +	if cooldownSeconds == 0 {
-+		cooldownSeconds = 600
++		cooldownSeconds = 1800
 +	}
-+	return newSSHAuthGuard(threshold, time.Duration(windowSeconds)*time.Second, time.Duration(cooldownSeconds)*time.Second, flags.SSHAuthRootOnly, reportSSHAuthGuardAlert)
++	return newSSHAuthGuard(threshold, time.Duration(windowSeconds)*time.Second, time.Duration(cooldownSeconds)*time.Second, flags.SSHAuthRootOnly, flags.SSHAuthAggregateByIP, newSSHAuthBanPolicyFromFlags(), reportSSHAuthGuardAlert)
 +}
 +
-+func newSSHAuthGuard(threshold int, window, cooldown time.Duration, rootOnly bool, report func(sshAuthGuardAlert) error) *sshAuthGuard {
++func newSSHAuthGuard(threshold int, window, cooldown time.Duration, rootOnly bool, aggregateByIP bool, banPolicy *sshAuthBanPolicy, report func(sshAuthGuardAlert) error) *sshAuthGuard {
 +	if threshold <= 0 {
 +		threshold = 5
 +	}
@@ -550,21 +597,45 @@ index 0000000..4f09e90
 +		window = time.Minute
 +	}
 +	if cooldown <= 0 {
-+		cooldown = 10 * time.Minute
++		cooldown = 30 * time.Minute
 +	}
 +	if report == nil {
 +		report = func(sshAuthGuardAlert) error { return nil }
 +	}
 +	return &sshAuthGuard{
-+		threshold: threshold,
-+		window:    window,
-+		cooldown:  cooldown,
-+		rootOnly:  rootOnly,
-+		report:    report,
-+		now:       time.Now,
-+		buckets:   make(map[string][]sshAuthFailure),
-+		lastAlert: make(map[string]time.Time),
++		threshold:     threshold,
++		window:        window,
++		cooldown:      cooldown,
++		rootOnly:      rootOnly,
++		aggregateByIP: aggregateByIP,
++		banPolicy:     banPolicy,
++		report:        report,
++		now:           time.Now,
++		buckets:       make(map[string][]sshAuthFailure),
++		lastAlert:     make(map[string]time.Time),
 +	}
++}
++
++func newSSHAuthBanPolicyFromFlags() *sshAuthBanPolicy {
++	policy := &sshAuthBanPolicy{
++		enabled:         flags.SSHAuthBanEnable,
++		after:           flags.SSHAuthBanAfter,
++		duration:        time.Duration(flags.SSHAuthBanDuration) * time.Second,
++		mode:            flags.SSHAuthBanMode,
++		dryRun:          flags.SSHAuthBanDryRun,
++		bannedUntilByIP: make(map[string]time.Time),
++	}
++	if policy.after <= 0 {
++		policy.after = 5
++	}
++	if policy.duration <= 0 {
++		policy.duration = time.Hour
++	}
++	if strings.TrimSpace(policy.mode) == "" {
++		policy.mode = "nftables"
++	}
++	policy.whitelist = parseSSHAuthBanWhitelist(flags.SSHAuthBanWhitelist)
++	return policy
 +}
 +
 +func watchSSHAuthGuardJournal(ctx context.Context, guard *sshAuthGuard) {
@@ -725,7 +796,7 @@ index 0000000..4f09e90
 +	if g.rootOnly && failure.user != "root" {
 +		return
 +	}
-+	key := failure.sourceIP + "|" + failure.user
++	key := g.bucketKey(failure)
 +	cutoff := failure.occurredAt.Add(-g.window)
 +	bucket := g.buckets[key][:0]
 +	for _, item := range g.buckets[key] {
@@ -743,17 +814,60 @@ index 0000000..4f09e90
 +		return
 +	}
 +	g.lastAlert[key] = failure.occurredAt
++	userText := failure.user
++	methodText := failure.method
++	if g.aggregateByIP {
++		userText = joinSSHAuthGuardUsers(bucket)
++		methodText = joinSSHAuthGuardMethods(bucket)
++	}
++	banStatus := "未启用自动封禁"
++	if g.banPolicy != nil {
++		banStatus = g.banPolicy.MaybeBan(failure.sourceIP, len(bucket), failure.occurredAt)
++	}
 +	if err := g.report(sshAuthGuardAlert{
 +		sourceIP:      failure.sourceIP,
-+		user:          failure.user,
-+		method:        failure.method,
++		user:          userText,
++		method:        methodText,
 +		failedCount:   len(bucket),
 +		windowSeconds: int(g.window / time.Second),
 +		occurredAt:    failure.occurredAt,
 +		sampleMessage: failure.sampleMessage,
++		banStatus:     banStatus,
 +	}); err != nil {
 +		log.Printf("failed to report SSH auth guard alert: %v", err)
 +	}
++}
++
++func (g *sshAuthGuard) bucketKey(failure sshAuthFailure) string {
++	if g.aggregateByIP {
++		return failure.sourceIP
++	}
++	return failure.sourceIP + "|" + failure.user
++}
++
++func joinSSHAuthGuardUsers(bucket []sshAuthFailure) string {
++	return joinSSHAuthGuardValues(bucket, func(f sshAuthFailure) string { return f.user })
++}
++
++func joinSSHAuthGuardMethods(bucket []sshAuthFailure) string {
++	return joinSSHAuthGuardValues(bucket, func(f sshAuthFailure) string { return f.method })
++}
++
++func joinSSHAuthGuardValues(bucket []sshAuthFailure, pick func(sshAuthFailure) string) string {
++	seen := make(map[string]bool, len(bucket))
++	values := make([]string, 0, len(bucket))
++	for _, failure := range bucket {
++		value := strings.TrimSpace(pick(failure))
++		if value == "" || seen[value] {
++			continue
++		}
++		seen[value] = true
++		values = append(values, value)
++	}
++	if len(values) == 0 {
++		return "unknown"
++	}
++	return strings.Join(values, ", ")
 +}
 +
 +func reportSSHAuthGuardAlert(alert sshAuthGuardAlert) error {
@@ -765,6 +879,7 @@ index 0000000..4f09e90
 +		"window_seconds": alert.windowSeconds,
 +		"occurred_at":    alert.occurredAt.Format(time.RFC3339Nano),
 +		"sample_message": alert.sampleMessage,
++		"ban_status":     alert.banStatus,
 +	})
 +	if err != nil {
 +		return err
@@ -790,6 +905,120 @@ index 0000000..4f09e90
 +		return fmt.Errorf("status %s: %s", resp.Status, strings.TrimSpace(string(data)))
 +	}
 +	return nil
++}
++
++func parseSSHAuthBanWhitelist(raw string) []net.IPNet {
++	parts := strings.Split(raw, ",")
++	ranges := make([]net.IPNet, 0, len(parts))
++	for _, part := range parts {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		if ip := net.ParseIP(part); ip != nil {
++			bits := 32
++			if ip.To4() == nil {
++				bits = 128
++			}
++			ranges = append(ranges, net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
++			continue
++		}
++		if _, cidr, err := net.ParseCIDR(part); err == nil {
++			ranges = append(ranges, *cidr)
++		}
++	}
++	return ranges
++}
++
++func (p *sshAuthBanPolicy) MaybeBan(sourceIP string, failedCount int, now time.Time) string {
++	if p == nil || !p.enabled {
++		return "未启用自动封禁"
++	}
++	if failedCount < p.after {
++		return "未达到自动封禁阈值"
++	}
++	ip := net.ParseIP(sourceIP)
++	if ip == nil {
++		return "封禁失败：来源 IP 无效"
++	}
++	if p.isWhitelisted(ip) {
++		return "白名单已跳过"
++	}
++	p.bannedMu.Lock()
++	if until, ok := p.bannedUntilByIP[sourceIP]; ok && until.After(now) {
++		remaining := int(until.Sub(now).Seconds())
++		p.bannedMu.Unlock()
++		return fmt.Sprintf("已封禁 %d 秒", remaining)
++	}
++	p.bannedUntilByIP[sourceIP] = now.Add(p.duration)
++	p.bannedMu.Unlock()
++
++	if p.dryRun {
++		log.Printf("SSH auth guard dry-run would ban %s for %s", sourceIP, p.duration)
++		return fmt.Sprintf("dry-run：将封禁 %d 秒", int(p.duration/time.Second))
++	}
++	if p.mode != "nftables" {
++		return "封禁失败：仅支持 nftables"
++	}
++	if err := applySSHAuthNftablesBan(sourceIP, p.duration); err != nil {
++		return "封禁失败：" + sanitizeSSHAuthGuardSample(err.Error())
++	}
++	return fmt.Sprintf("已封禁 %d 秒", int(p.duration/time.Second))
++}
++
++func (p *sshAuthBanPolicy) isWhitelisted(ip net.IP) bool {
++	for _, cidr := range p.whitelist {
++		if cidr.Contains(ip) {
++			return true
++		}
++	}
++	return false
++}
++
++func applySSHAuthNftablesBan(sourceIP string, duration time.Duration) error {
++	ip := net.ParseIP(sourceIP)
++	if ip == nil {
++		return fmt.Errorf("invalid source IP")
++	}
++	family := "ip"
++	setName := "blocked4"
++	setType := "ipv4_addr"
++	if ip.To4() == nil {
++		family = "ip6"
++		setName = "blocked6"
++		setType = "ipv6_addr"
++	}
++	timeout := fmt.Sprintf("%ds", int(duration/time.Second))
++	setupCommands := [][]string{
++		{"add", "table", "inet", "komari_auth_guard"},
++		{"add", "set", "inet", "komari_auth_guard", setName, "{", "type", setType, ";", "flags", "timeout", ";", "}"},
++		{"add", "chain", "inet", "komari_auth_guard", "input", "{", "type", "filter", "hook", "input", "priority", "-100", ";", "policy", "accept", ";", "}"},
++		{"add", "rule", "inet", "komari_auth_guard", "input", family, "saddr", "@" + setName, "tcp", "dport", "22", "drop"},
++	}
++	for _, args := range setupCommands {
++		if err := runSSHAuthNft(args, true); err != nil {
++			return err
++		}
++	}
++	return runSSHAuthNft([]string{"add", "element", "inet", "komari_auth_guard", setName, "{", sourceIP, "timeout", timeout, "}"}, true)
++}
++
++func runSSHAuthNft(args []string, ignoreExists bool) error {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, "nft", args...)
++	out, err := cmd.CombinedOutput()
++	output := strings.TrimSpace(string(out))
++	if err == nil {
++		return nil
++	}
++	if ignoreExists && strings.Contains(output, "File exists") {
++		return nil
++	}
++	if output == "" {
++		return err
++	}
++	return fmt.Errorf("%v: %s", err, output)
 +}
 +
 +func sanitizeSSHAuthGuardToken(value, fallback string) string {
@@ -838,10 +1067,10 @@ index 0000000..4f09e90
 +}
 diff --git a/server/ssh_auth_guard_test.go b/server/ssh_auth_guard_test.go
 new file mode 100644
-index 0000000..6c864c4
+index 0000000..b6f8304
 --- /dev/null
 +++ b/server/ssh_auth_guard_test.go
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,112 @@
 +package server
 +
 +import (
@@ -876,7 +1105,7 @@ index 0000000..6c864c4
 +
 +func TestSSHAuthGuardThresholdAndCooldown(t *testing.T) {
 +	var alerts []sshAuthGuardAlert
-+	guard := newSSHAuthGuard(5, time.Minute, 10*time.Minute, false, func(alert sshAuthGuardAlert) error {
++	guard := newSSHAuthGuard(5, time.Minute, 10*time.Minute, false, false, nil, func(alert sshAuthGuardAlert) error {
 +		alerts = append(alerts, alert)
 +		return nil
 +	})
@@ -904,9 +1133,41 @@ index 0000000..6c864c4
 +	}
 +}
 +
++func TestSSHAuthGuardAggregateByIP(t *testing.T) {
++	var alerts []sshAuthGuardAlert
++	guard := newSSHAuthGuard(3, time.Minute, 10*time.Minute, false, true, nil, func(alert sshAuthGuardAlert) error {
++		alerts = append(alerts, alert)
++		return nil
++	})
++	base := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
++	guard.Observe(sshAuthFailure{sourceIP: "203.0.113.5", user: "root", method: "password", occurredAt: base})
++	guard.Observe(sshAuthFailure{sourceIP: "203.0.113.5", user: "ubuntu", method: "password", occurredAt: base.Add(time.Second)})
++	guard.Observe(sshAuthFailure{sourceIP: "203.0.113.5", user: "admin", method: "invalid-user", occurredAt: base.Add(2 * time.Second)})
++	if len(alerts) != 1 {
++		t.Fatalf("expected one aggregate alert, got %d", len(alerts))
++	}
++	if alerts[0].user != "root, ubuntu, admin" {
++		t.Fatalf("unexpected aggregate users: %q", alerts[0].user)
++	}
++}
++
++func TestSSHAuthBanPolicyDryRunAndWhitelist(t *testing.T) {
++	policy := &sshAuthBanPolicy{enabled: true, after: 2, duration: time.Hour, mode: "nftables", dryRun: true, whitelist: parseSSHAuthBanWhitelist("198.51.100.0/24"), bannedUntilByIP: make(map[string]time.Time)}
++	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
++	if got := policy.MaybeBan("198.51.100.7", 2, now); got != "白名单已跳过" {
++		t.Fatalf("whitelist status = %q", got)
++	}
++	if got := policy.MaybeBan("203.0.113.7", 2, now); got != "dry-run：将封禁 3600 秒" {
++		t.Fatalf("dry-run status = %q", got)
++	}
++	if got := policy.MaybeBan("203.0.113.7", 2, now.Add(time.Minute)); got != "已封禁 3540 秒" {
++		t.Fatalf("repeat status = %q", got)
++	}
++}
++
 +func TestSSHAuthGuardRootOnly(t *testing.T) {
 +	var alerts []sshAuthGuardAlert
-+	guard := newSSHAuthGuard(2, time.Minute, 10*time.Minute, true, func(alert sshAuthGuardAlert) error {
++	guard := newSSHAuthGuard(2, time.Minute, 10*time.Minute, true, false, nil, func(alert sshAuthGuardAlert) error {
 +		alerts = append(alerts, alert)
 +		return nil
 +	})
@@ -921,162 +1182,6 @@ index 0000000..6c864c4
 +	if len(alerts) != 1 {
 +		t.Fatalf("root failures should trigger alert, got %d", len(alerts))
 +	}
-+}
-diff --git a/server/ssh_login_watch.go b/server/ssh_login_watch.go
-new file mode 100644
-index 0000000..7762427
---- /dev/null
-+++ b/server/ssh_login_watch.go
-@@ -0,0 +1,150 @@
-+package server
-+
-+import (
-+	"bufio"
-+	"context"
-+	"fmt"
-+	"io"
-+	"log"
-+	"net"
-+	"os"
-+	"regexp"
-+	"strconv"
-+	"strings"
-+	"time"
-+
-+	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
-+)
-+
-+var acceptedSSHLoginPattern = regexp.MustCompile(`sshd(?:\[[0-9]+\])?: Accepted ([^ ]+) for ([A-Za-z0-9._-]+) from ([0-9A-Fa-f:.]+) port ([0-9]+)`)
-+
-+type sshLogState struct {
-+	path   string
-+	offset int64
-+	info   os.FileInfo
-+}
-+
-+// StartSSHLoginWatcher tails only successful OpenSSH authentication records.
-+// It never writes SSH configuration and never executes a command. Existing
-+// log contents are skipped on startup so an agent restart cannot replay old
-+// login events.
-+func StartSSHLoginWatcher(ctx context.Context) {
-+	paths := []string{"/var/log/auth.log", "/var/log/secure"}
-+	states := make(map[string]*sshLogState, len(paths))
-+	for _, path := range paths {
-+		if state := openSSHLogAtEnd(path); state != nil {
-+			states[path] = state
-+			log.Printf("SSH login notifier watching %s", path)
-+		}
-+	}
-+	if len(states) == 0 {
-+		log.Printf("SSH login notifier waiting for /var/log/auth.log or /var/log/secure")
-+	}
-+
-+	ticker := time.NewTicker(2 * time.Second)
-+	defer ticker.Stop()
-+	for {
-+		select {
-+		case <-ctx.Done():
-+			return
-+		case <-ticker.C:
-+			for _, path := range paths {
-+				state := states[path]
-+				if state == nil {
-+					if next := openSSHLogAtEnd(path); next != nil {
-+						states[path] = next
-+						log.Printf("SSH login notifier watching %s", path)
-+					}
-+					continue
-+				}
-+				if err := pollSSHLog(state); err != nil && !os.IsNotExist(err) {
-+					log.Printf("SSH login notifier failed to read %s: %v", path, err)
-+				}
-+			}
-+		}
-+	}
-+}
-+
-+func openSSHLogAtEnd(path string) *sshLogState {
-+	info, err := os.Stat(path)
-+	if err != nil || !info.Mode().IsRegular() {
-+		return nil
-+	}
-+	return &sshLogState{path: path, offset: info.Size(), info: info}
-+}
-+
-+func pollSSHLog(state *sshLogState) error {
-+	info, err := os.Stat(state.path)
-+	if err != nil {
-+		return err
-+	}
-+	if !os.SameFile(state.info, info) || info.Size() < state.offset {
-+		state.offset = 0
-+		state.info = info
-+	}
-+	if info.Size() == state.offset {
-+		return nil
-+	}
-+
-+	file, err := os.Open(state.path)
-+	if err != nil {
-+		return err
-+	}
-+	defer file.Close()
-+	if _, err := file.Seek(state.offset, io.SeekStart); err != nil {
-+		return err
-+	}
-+	scanner := bufio.NewScanner(file)
-+	scanner.Buffer(make([]byte, 4096), 64*1024)
-+	for scanner.Scan() {
-+		if event, ok := parseAcceptedSSHLogin(scanner.Text()); ok {
-+			if err := reportAcceptedSSHLogin(event); err != nil {
-+				log.Printf("failed to report successful SSH login: %v", err)
-+			}
-+		}
-+	}
-+	if err := scanner.Err(); err != nil {
-+		return err
-+	}
-+	state.offset, err = file.Seek(0, io.SeekCurrent)
-+	return err
-+}
-+
-+type acceptedSSHLogin struct {
-+	user       string
-+	remoteIP   string
-+	remotePort int
-+	authMethod string
-+	occurredAt time.Time
-+}
-+
-+func parseAcceptedSSHLogin(line string) (acceptedSSHLogin, bool) {
-+	match := acceptedSSHLoginPattern.FindStringSubmatch(line)
-+	if len(match) != 5 || net.ParseIP(match[3]) == nil {
-+		return acceptedSSHLogin{}, false
-+	}
-+	port, err := strconv.Atoi(match[4])
-+	if err != nil || port < 1 || port > 65535 {
-+		return acceptedSSHLogin{}, false
-+	}
-+	method := strings.ToLower(strings.SplitN(match[1], "/", 2)[0])
-+	switch method {
-+	case "publickey", "password", "keyboard-interactive", "hostbased":
-+	default:
-+		return acceptedSSHLogin{}, false
-+	}
-+	return acceptedSSHLogin{user: match[2], remoteIP: match[3], remotePort: port, authMethod: method, occurredAt: time.Now().UTC()}, true
-+}
-+
-+func reportAcceptedSSHLogin(event acceptedSSHLogin) error {
-+	id := fmt.Sprintf("ssh-login-%d", event.occurredAt.UnixNano())
-+	payload := v2.NewRequest(id, v2.MethodAgentSSHLogin, map[string]interface{}{
-+		"user":        event.user,
-+		"remote_ip":   event.remoteIP,
-+		"remote_port": event.remotePort,
-+		"auth_method": event.authMethod,
-+		"occurred_at": event.occurredAt.Format(time.RFC3339Nano),
-+	})
-+	_, err := postV2Request(payload)
-+	return err
 +}
 diff --git a/server/ssh_login_watch_test.go b/server/ssh_login_watch_test.go
 new file mode 100644
